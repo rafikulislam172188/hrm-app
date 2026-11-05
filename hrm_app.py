@@ -96,7 +96,7 @@ def init():
     ]:
         q(s, fetch=False)
     defaults = {"company": "My Company", "currency": "SAR", "timezone": "Asia/Riyadh",
-                "std_hours": "8", "work_days": "30", "ot_mult": "1.5", "date_fmt": "%d-%m-%Y", "gosi_pct": "0", "gosi_nat": "Saudi", "vat_pct": "15", "weekend": "4"}
+                "std_hours": "8", "work_days": "26", "ot_mult": "1.5", "date_fmt": "%d-%m-%Y", "gosi_pct": "0", "gosi_nat": "Saudi", "vat_pct": "15", "weekend": "4", "def_normal": "10", "def_ot": "2"}
     for k, v in defaults.items():
         q("INSERT OR IGNORE INTO settings VALUES(?,?)", (k, v), fetch=False)
     q("CREATE TABLE IF NOT EXISTS companies(id INTEGER PRIMARY KEY, name TEXT UNIQUE, vat TEXT)", fetch=False)
@@ -205,7 +205,7 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=()):
             ld, off = (g.status == "Leave").sum(), (g.status == "Off").sum()
             if r.pay_type == "Monthly":
                 hr = r.rate / wd / std
-                basic = min(r.rate / wd * (len(pres) + ld + off), r.rate * months)
+                basic = min(r.rate / wd * (len(nor) + ld), r.rate * months)
             else:
                 hr, basic = r.rate, reg_h * r.rate
             otr = r.ot_rate if r.ot_rate > 0 else hr * otm
@@ -398,29 +398,40 @@ elif page == "Setup":
 # ---------------- Attendance
 elif page == "Attendance":
     st.header("Attendance: P / A / L, normal hours & OT hours")
-    cm, ds = q("SELECT * FROM companies"), q("SELECT * FROM departments")
+    cm, ds, sp = q("SELECT * FROM companies"), q("SELECT * FROM departments"), q("SELECT * FROM sponsors")
     cn, sn = dict(zip(cm.id, cm.name)), dict(zip(ds.id, ds.name))
     ci, si = {v: int(k) for k, v in cn.items()}, {v: int(k) for k, v in sn.items()}
     c = st.columns(3)
     day = c[0].date_input("Date", today())
     fco, fsec = c[1].multiselect("Company", list(cn.values())), c[2].multiselect("Section", list(sn.values()))
-    e = apply_f(emp_df(), fsec, (), (), (), fco)
+    c = st.columns(2)
+    fspn = c[0].multiselect("Sponsor / Kofil", sp.name.tolist())
+    fst = c[1].multiselect("Status filter (as saved for this date)", ["P", "A", "L", "O", "Not marked"])
+    e = apply_f(emp_df(), fsec, (), (), fspn, fco)
     old = q("SELECT * FROM attendance WHERE day=?", (str(day),))
-    std = float(S("std_hours"))
+    dn, do_ = float(S("def_normal")), float(S("def_ot"))
+    wkend = day.weekday() == int(S("weekend"))
     nm = lambda v, d: d.get(int(v), "") if pd.notna(v) else ""
     rows = []
     for _, r in e.iterrows():
         o = old[old.emp_id == r.id]
         h = o.iloc[0] if len(o) else None
+        cur = CODE.get(h["status"], "P") if h is not None else None
+        if fst and (cur or "Not marked") not in fst:
+            continue
         g = lambda col, dflt: h[col] if h is not None and pd.notna(h[col]) else dflt
-        stt = CODE.get(g("status", "Present"), "P")
-        rows.append({"id": r.id, "Code": r.code, "Name": r["name"], "Labour": r.labour_type,
+        stt = cur or ("O" if wkend else "P")
+        sv = h is not None and stt == "P"
+        rows.append({"id": r.id, "Code": r.code, "Name": r["name"], "Labour": r.labour_type, "Sponsor": r.sponsor or "",
                      "Company": nm(g("company_id", None), cn) or (r.company or ""),
                      "Section": nm(g("dept_id", None), sn) or (r.section or ""),
-                     "Status": stt, "Normal Hrs": float(g("hours", std if stt == "P" else 0.0)),
-                     "OT Hrs": float(g("ot_hours", 0.0))})
+                     "Status": stt, "Normal Hrs": float(g("hours", dn)) if sv else dn,
+                     "OT Hrs": float(g("ot_hours", 0.0)) if sv else do_})
+    if wkend:
+        st.info("This date is the weekend day: everyone starts as O (no work, no pay). Change to P only for those who "
+                "worked - all their hours are then paid as OT.")
     ed = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True,
-                        disabled=["id", "Code", "Name", "Labour"],
+                        key=f"att{day}{fco}{fsec}{fspn}{fst}", disabled=["id", "Code", "Name", "Labour", "Sponsor"],
                         column_config={"id": None,
                                        "Company": st.column_config.SelectboxColumn(options=[""] + list(cn.values())),
                                        "Section": st.column_config.SelectboxColumn(options=[""] + list(sn.values())),
@@ -428,8 +439,9 @@ elif page == "Attendance":
                                                                                   help="P=Present, A=Absent, L=Leave, O=Off"),
                                        "Normal Hrs": st.column_config.NumberColumn(min_value=0.0, max_value=24.0, step=0.5),
                                        "OT Hrs": st.column_config.NumberColumn(min_value=0.0, max_value=16.0, step=0.5)})
-    st.caption("P = Present, A = Absent, L = Leave, O = Off. Monthly staff are paid per day; type their OT hours in "
-               "'OT Hrs' and they are paid extra at the OT rate. Hours on the weekend day (Settings) are all paid as OT.")
+    st.caption("P = Present (paid), L = Leave (paid), A = Absent (not paid), O = Off (not paid). Normal and OT hours are "
+               "pre-filled from Settings (default 10 + 2) - change per person if different. Monthly staff are paid per "
+               "day; OT hours are paid extra. Weekend day: no work = no pay, work = all hours paid as OT.")
     if st.button("💾 Save attendance"):
         for _, r in ed.iterrows():
             pr_ = r.Status == "P"
@@ -727,7 +739,7 @@ elif page == "Settings":
         tzs = sorted(available_timezones())
         tz = st.selectbox("Time zone", tzs, tzs.index(S("timezone")))
         sh = st.number_input("Standard hours/day", 1.0, 24.0, float(S("std_hours")))
-        wd = st.number_input("Working days/month (monthly salary divisor)", 1.0, 31.0, float(S("work_days")))
+        wd = st.number_input("Working days/month = monthly salary divisor (26 if the weekend day is unpaid)", 1.0, 31.0, float(S("work_days")))
         ot = st.number_input("Overtime multiplier", 1.0, 5.0, float(S("ot_mult")))
         df_ = st.selectbox("Date format", ["%d-%m-%Y", "%Y-%m-%d", "%m/%d/%Y"])
         gp = st.number_input("GOSI employee deduction % (0 = off)", 0.0, 100.0, float(S("gosi_pct")))
@@ -735,9 +747,11 @@ elif page == "Settings":
         vp = st.number_input("VAT % on client invoices", 0.0, 100.0, float(S("vat_pct")))
         days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         wk = st.selectbox("Weekend OT day (hours worked this day are paid at OT rate)", days, int(S("weekend")))
+        dn = st.number_input("Default normal hours (auto-filled in Attendance)", 0.0, 24.0, float(S("def_normal")))
+        do_ = st.number_input("Default OT hours (auto-filled in Attendance)", 0.0, 16.0, float(S("def_ot")))
         if st.form_submit_button("Save"):
             for k, v in dict(company=co, currency=cu, timezone=tz, std_hours=sh, work_days=wd,
-                             ot_mult=ot, date_fmt=df_, gosi_pct=gp, gosi_nat=gn, vat_pct=vp, weekend=days.index(wk)).items():
+                             ot_mult=ot, date_fmt=df_, gosi_pct=gp, gosi_nat=gn, vat_pct=vp, weekend=days.index(wk), def_normal=dn, def_ot=do_).items():
                 q("REPLACE INTO settings VALUES(?,?)", (k, str(v)), fetch=False)
             st.success("Saved"); st.rerun()
 
