@@ -8,6 +8,8 @@ import pandas as pd
 import streamlit as st
 
 DB = "hrm.db"
+CODE = {"Present": "P", "Absent": "A", "Leave": "L", "Off": "O"}
+REV = {v: k for k, v in CODE.items()}
 st.set_page_config(page_title="HRM", layout="wide")
 st.markdown("""<style>
 .stApp{background:#eef5ef;color:#1b2b22}
@@ -101,7 +103,7 @@ def init():
     q("CREATE TABLE IF NOT EXISTS costs(id INTEGER PRIMARY KEY, day TEXT, category TEXT, emp_id INT, company_id INT, amount REAL, note TEXT)", fetch=False)
     for t_, c_ in [("employees", "id_expiry TEXT"), ("employees", "company_id INT"), ("employees", "food_allow REAL DEFAULT 0"),
                    ("employees", "ot_rate REAL DEFAULT 0"), ("employees", "bill_rate REAL DEFAULT 0"),
-                   ("employees", "pay_mode TEXT DEFAULT 'Bank'"), ("attendance", "company_id INT"), ("attendance", "dept_id INT")]:
+                   ("employees", "pay_mode TEXT DEFAULT 'Bank'"), ("attendance", "company_id INT"), ("attendance", "dept_id INT"), ("attendance", "ot_hours REAL")]:
         try:
             q(f"ALTER TABLE {t_} ADD COLUMN {c_}", fetch=False)
         except Exception:
@@ -190,6 +192,7 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=()):
         if a.empty:
             continue
         a["cid"], a["sid"] = a.company_id.fillna(r.company_id), a.dept_id.fillna(r.dept_id)
+        a["ot_hours"], a["hours"] = a.ot_hours.fillna(0), a.hours.fillna(0)
         ad = adj[adj.emp_id == r.id]
         tp = max((a.status == "Present").sum(), 1)
         first = True
@@ -197,8 +200,8 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=()):
             pres = g[g.status == "Present"]
             wkd = pres[pd.to_datetime(pres.day).dt.weekday == we]
             nor = pres.drop(wkd.index)
-            ot_h, wk_h = (nor.hours - std).clip(lower=0).sum(), wkd.hours.sum()
-            reg_h = nor.hours.sum() - ot_h
+            ot_h, wk_h = nor.ot_hours.sum(), (wkd.hours + wkd.ot_hours).sum()
+            reg_h = nor.hours.sum()
             ld, off = (g.status == "Leave").sum(), (g.status == "Off").sum()
             if r.pay_type == "Monthly":
                 hr = r.rate / wd / std
@@ -216,10 +219,10 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=()):
             rows.append({"Code": r.code, "Name": r["name"], "Company": nm(cn, cid), "Section": nm(sn, sid),
                          "Sponsor": r.sponsor or "-", "Labour": r.labour_type, "Pay": r.pay_type, "Mode": r.pay_mode,
                          "Rate": r.rate, "Days": len(pres), "Leave": ld, "Absent": (g.status == "Absent").sum(),
-                         "Hours": pres.hours.sum(), "OT Hrs": ot_h, "Wknd Hrs": wk_h, "Basic": basic, "Food": food,
+                         "Hours": (pres.hours + pres.ot_hours).sum(), "OT Hrs": ot_h, "Wknd Hrs": wk_h, "Basic": basic, "Food": food,
                          "OT Pay": ot_h * otr, "Wknd OT": wk_h * otr, "Allowances": add, "Advance": adv,
                          "Deduction": ded, "GOSI": gosi, "Net": net, "Bank": net if r.pay_mode == "Bank" else 0,
-                         "Cash": net if r.pay_mode != "Bank" else 0, "Invoice": pres.hours.sum() * r.bill_rate})
+                         "Cash": net if r.pay_mode != "Bank" else 0, "Invoice": (pres.hours + pres.ot_hours).sum() * r.bill_rate})
     df = pd.DataFrame(rows, columns=PCOLS).round(2)
     if sec: df = df[df.Section.isin(sec)]
     if co: df = df[df.Company.isin(co)]
@@ -262,8 +265,8 @@ if page == "Dashboard":
     t = str(today())
     m1 = today().replace(day=1)
     me = (m1.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
-    a = q("""SELECT a.status, a.in_t, e.name FROM attendance a JOIN employees e ON e.id=a.emp_id
-        WHERE a.day=? AND e.active=1""", (t,))
+    a = q("""SELECT a.status, COALESCE(a.hours,0) AS hours, COALESCE(a.ot_hours,0) AS ot_hours, e.name FROM attendance a JOIN employees e ON e.id=a.emp_id
+        WHERE a.day=? AND e.active=1 ORDER BY a.id DESC""", (t,))
     n = len(e)
     pr, ab, lv = (int((a.status == x).sum()) for x in ("Present", "Absent", "Leave"))
     nm = max(n - pr - ab - lv, 0)
@@ -299,10 +302,10 @@ if page == "Dashboard":
          ("Rejected", L("Rejected"), "#d64933")], len(lvs), "Total") + "</div>", unsafe_allow_html=True)
     st.write("")
     c3, c4 = st.columns(2)
-    rc = a[a.status == "Present"].sort_values("in_t", ascending=False).head(5)
+    rc = a[a.status == "Present"].head(5)
     items = "".join(
         f'<div class="ci"><div class="av">{html.escape(str(r["name"])[:1].upper())}</div>'
-        f'<div><b>{html.escape(str(r["name"]))}</b><br><small>{r.in_t}</small></div>'
+        f'<div><b>{html.escape(str(r["name"]))}</b><br><small>{r.hours:g}h + OT {r.ot_hours:g}h</small></div>'
         f'<span class="badge">{r.status}</span></div>' for _, r in rc.iterrows()
     ) or "<small>No check-ins today yet.</small>"
     c3.markdown(f'<div class="card"><div class="ttl">Recent Check-ins</div>{items}</div>',
@@ -394,7 +397,7 @@ elif page == "Setup":
 
 # ---------------- Attendance
 elif page == "Attendance":
-    st.header("Attendance (company & section per day)")
+    st.header("Attendance: P / A / L, normal hours & OT hours")
     cm, ds = q("SELECT * FROM companies"), q("SELECT * FROM departments")
     cn, sn = dict(zip(cm.id, cm.name)), dict(zip(ds.id, ds.name))
     ci, si = {v: int(k) for k, v in cn.items()}, {v: int(k) for k, v in sn.items()}
@@ -403,30 +406,38 @@ elif page == "Attendance":
     fco, fsec = c[1].multiselect("Company", list(cn.values())), c[2].multiselect("Section", list(sn.values()))
     e = apply_f(emp_df(), fsec, (), (), (), fco)
     old = q("SELECT * FROM attendance WHERE day=?", (str(day),))
+    std = float(S("std_hours"))
     nm = lambda v, d: d.get(int(v), "") if pd.notna(v) else ""
     rows = []
     for _, r in e.iterrows():
         o = old[old.emp_id == r.id]
         h = o.iloc[0] if len(o) else None
         g = lambda col, dflt: h[col] if h is not None and pd.notna(h[col]) else dflt
+        stt = CODE.get(g("status", "Present"), "P")
         rows.append({"id": r.id, "Code": r.code, "Name": r["name"], "Labour": r.labour_type,
                      "Company": nm(g("company_id", None), cn) or (r.company or ""),
                      "Section": nm(g("dept_id", None), sn) or (r.section or ""),
-                     "Status": g("status", "Present"), "In": g("in_t", "08:00"), "Out": g("out_t", "17:00")})
+                     "Status": stt, "Normal Hrs": float(g("hours", std if stt == "P" else 0.0)),
+                     "OT Hrs": float(g("ot_hours", 0.0))})
     ed = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True,
                         disabled=["id", "Code", "Name", "Labour"],
                         column_config={"id": None,
                                        "Company": st.column_config.SelectboxColumn(options=[""] + list(cn.values())),
                                        "Section": st.column_config.SelectboxColumn(options=[""] + list(sn.values())),
-                                       "Status": st.column_config.SelectboxColumn(options=["Present", "Absent", "Leave", "Off"])})
-    st.caption("Time HH:MM (24h), overnight shifts supported. Hours on the weekend day (Settings) are paid as OT.")
+                                       "Status": st.column_config.SelectboxColumn(options=["P", "A", "L", "O"],
+                                                                                  help="P=Present, A=Absent, L=Leave, O=Off"),
+                                       "Normal Hrs": st.column_config.NumberColumn(min_value=0.0, max_value=24.0, step=0.5),
+                                       "OT Hrs": st.column_config.NumberColumn(min_value=0.0, max_value=16.0, step=0.5)})
+    st.caption("P = Present, A = Absent, L = Leave, O = Off. Monthly staff are paid per day; type their OT hours in "
+               "'OT Hrs' and they are paid extra at the OT rate. Hours on the weekend day (Settings) are all paid as OT.")
     if st.button("💾 Save attendance"):
         for _, r in ed.iterrows():
-            h = hrs(r.In, r.Out) if r.Status == "Present" else 0
-            q("INSERT INTO attendance(emp_id,day,status,in_t,out_t,hours,company_id,dept_id) VALUES(?,?,?,?,?,?,?,?) "
-              "ON CONFLICT(emp_id,day) DO UPDATE SET status=excluded.status,in_t=excluded.in_t,out_t=excluded.out_t,"
-              "hours=excluded.hours,company_id=excluded.company_id,dept_id=excluded.dept_id",
-              (int(r.id), str(day), r.Status, r.In, r.Out, h, ci.get(r.Company), si.get(r.Section)), fetch=False)
+            pr_ = r.Status == "P"
+            q("INSERT INTO attendance(emp_id,day,status,hours,ot_hours,company_id,dept_id) VALUES(?,?,?,?,?,?,?) "
+              "ON CONFLICT(emp_id,day) DO UPDATE SET status=excluded.status,hours=excluded.hours,"
+              "ot_hours=excluded.ot_hours,company_id=excluded.company_id,dept_id=excluded.dept_id",
+              (int(r.id), str(day), REV[r.Status], float(r["Normal Hrs"]) if pr_ else 0.0,
+               float(r["OT Hrs"]) if pr_ else 0.0, ci.get(r.Company), si.get(r.Section)), fetch=False)
         st.success("Saved")
 
 # ---------------- Leave
@@ -634,7 +645,7 @@ elif page == "Import":
 # ---------------- Reports
 elif page == "Reports":
     st.header("Reports (custom date range)")
-    kinds = ["Attendance detail", "Attendance summary"]
+    kinds = ["Attendance detail", "Attendance summary", "Attendance sheet (P/A/L)"]
     if role != "Manager":
         kinds += ["Payroll sheet", "Company-wise", "Section-wise", "Kofil-wise", "Company x Kofil matrix",
                   "Hours (hourly basis)", "ID / Iqama expiry", "EOSB provision"]
@@ -658,12 +669,27 @@ elif page == "Reports":
 
     if kind == "Attendance detail":
         df = q("""SELECT a.day, e.code, e.name, COALESCE(c.name,c0.name) AS company, COALESCE(d.name,d0.name) AS section,
-            s.name AS sponsor, e.labour_type, e.pay_type, a.status, a.in_t, a.out_t, a.hours
+            s.name AS sponsor, e.labour_type, e.pay_type, a.status, a.hours, a.ot_hours
             FROM attendance a JOIN employees e ON e.id=a.emp_id
             LEFT JOIN companies c ON c.id=a.company_id LEFT JOIN companies c0 ON c0.id=e.company_id
             LEFT JOIN departments d ON d.id=a.dept_id LEFT JOIN departments d0 ON d0.id=e.dept_id
             LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE a.day BETWEEN ? AND ? ORDER BY a.day""", (d1, d2))
         df = apply_f(df, *f[2:])
+    elif kind == "Attendance sheet (P/A/L)":
+        df = q("""SELECT e.code, e.name, COALESCE(c.name,c0.name,'-') AS company, COALESCE(d.name,d0.name,'-') AS section,
+            s.name AS sponsor, e.labour_type, e.pay_type, a.day, a.status, a.hours, COALESCE(a.ot_hours,0) AS ot
+            FROM attendance a JOIN employees e ON e.id=a.emp_id
+            LEFT JOIN companies c ON c.id=a.company_id LEFT JOIN companies c0 ON c0.id=e.company_id
+            LEFT JOIN departments d ON d.id=a.dept_id LEFT JOIN departments d0 ON d0.id=e.dept_id
+            LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE a.day BETWEEN ? AND ?""", (d1, d2))
+        df = apply_f(df, *f[2:])
+        if len(df):
+            df["c"], df["d"] = df.status.map(CODE).fillna("?"), df.day.str[5:]
+            ix = ["code", "name", "company", "section"]
+            grid = df.pivot_table(index=ix, columns="d", values="c", aggfunc="first").fillna("")
+            tot = df.groupby(ix).agg(P=("c", lambda x: (x == "P").sum()), A=("c", lambda x: (x == "A").sum()),
+                                     L=("c", lambda x: (x == "L").sum()), Normal_Hrs=("hours", "sum"), OT_Hrs=("ot", "sum"))
+            df = grid.join(tot).reset_index()
     elif kind == "ID / Iqama expiry":
         e = apply_f(emp_df(), *f[2:])
         x = e.id_expiry.fillna("")
@@ -877,10 +903,10 @@ if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Setup", "Attendance"
     elif page == "Attendance":
         a1, a2 = dr("mat")
         sq = st.text_input("Search code / name", key="masq")
-        manage("attendance", """SELECT a.id, a.day, e.code, e.name AS employee, a.status, a.in_t, a.out_t, a.hours
+        manage("attendance", """SELECT a.id, a.day, e.code, e.name AS employee, a.status, a.hours, a.ot_hours
             FROM attendance a JOIN employees e ON e.id=a.emp_id WHERE a.day BETWEEN ? AND ?
             AND (e.code LIKE ? OR e.name LIKE ?) ORDER BY a.day DESC, e.code""", (a1, a2, f"%{sq}%", f"%{sq}%"),
-               edit=["status", "in_t", "out_t", "hours"], selects={"status": ["Present", "Absent", "Leave", "Off"]}, key="att")
+               edit=["status", "hours", "ot_hours"], selects={"status": ["Present", "Absent", "Leave", "Off"]}, key="att")
 
     elif page == "Leave":
         manage("leaves", """SELECT l.id, l.emp_id, e.code, e.name AS employee, l.ltype, l.start, l.end, l.days, l.status
