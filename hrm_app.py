@@ -1,7 +1,7 @@
 """International HRM - Streamlit + SQLite
 Run: pip install streamlit pandas && streamlit run hrm_app.py
 """
-import sqlite3, hashlib, io
+import sqlite3, hashlib, io, html
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, available_timezones
 import pandas as pd
@@ -9,6 +9,31 @@ import streamlit as st
 
 DB = "hrm.db"
 st.set_page_config(page_title="HRM", layout="wide")
+st.markdown("""<style>
+.stApp{background:#eef5ef;color:#1b2b22}
+.stApp h1,.stApp h2,.stApp h3{color:#1b2b22}
+[data-testid="stSidebar"]{background:#14472f}
+[data-testid="stSidebar"] *{color:#e8f5ec !important}
+[data-testid="stSidebar"] .stButton button{background:transparent;border:1px solid #6fae8a}
+.card{background:#fff;color:#1b2b22;border-radius:14px;padding:16px 18px;box-shadow:0 2px 10px rgba(20,71,47,.08)}
+.kpi{display:flex;align-items:center;gap:14px}
+.kpi .ic{font-size:24px;width:46px;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center}
+.kpi .lb{font-size:13px;color:#6b7c72}
+.kpi .v{font-size:28px;font-weight:700}
+.ttl{font-weight:600;font-size:16px;margin-bottom:10px}
+.row{display:flex;align-items:center;gap:18px}
+.donut{width:130px;height:130px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.donut div{width:84px;height:84px;border-radius:50%;background:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:12px;color:#6b7c72}
+.donut b{font-size:24px;color:#1b2b22}
+.leg{font-size:13px;line-height:2;flex:1}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px}
+.ci{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid #eef2ee}
+.av{width:36px;height:36px;border-radius:50%;background:#2e7d4f;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:600}
+.badge{margin-left:auto;background:#e3f4e8;color:#2e7d4f;padding:2px 12px;border-radius:8px;font-size:12px}
+.bars{display:flex;align-items:flex-end;gap:12px;height:130px;margin-top:8px}
+.bars div{flex:1;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;font-size:11px;color:#6b7c72}
+.bars span{width:70%;background:#2e7d4f;border-radius:4px 4px 0 0;display:block}
+</style>""", unsafe_allow_html=True)
 
 
 def q(sql, p=(), fetch=True):
@@ -189,7 +214,9 @@ st.sidebar.write(f"👤 {st.session_state.user} ({role})")
 if st.sidebar.button("Logout"):
     st.session_state.clear()
     st.rerun()
-page = st.sidebar.radio("Menu", MENU)
+ICON = {"Dashboard": "🏠", "Employees": "👥", "Sections & Sponsors": "🏷️", "Attendance": "🗓️",
+        "Leave": "🌴", "Adjustments": "➕", "Payroll": "💵", "Reports": "📊", "Settings": "⚙️", "Users": "🔑"}
+page = st.sidebar.radio("Menu", MENU, format_func=lambda x: f"{ICON.get(x, '')}  {x}")
 st.sidebar.caption(f"Today: {today().strftime(S('date_fmt'))} ({S('timezone')})")
 
 # ---------------- Dashboard
@@ -197,13 +224,69 @@ if page == "Dashboard":
     st.header("Dashboard")
     e = emp_df()
     t = str(today())
-    a = q("SELECT status FROM attendance WHERE day=?", (t,))
-    c = st.columns(5)
-    c[0].metric("Total", len(e))
-    c[1].metric("Company", (e.labour_type == "Company").sum())
-    c[2].metric("Outside", (e.labour_type == "Outside").sum())
-    c[3].metric("Present today", (a.status == "Present").sum())
-    c[4].metric("On leave today", (a.status == "Leave").sum())
+    m1 = today().replace(day=1)
+    me = (m1.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    a = q("""SELECT a.status, a.in_t, e.name FROM attendance a JOIN employees e ON e.id=a.emp_id
+        WHERE a.day=? AND e.active=1""", (t,))
+    n = len(e)
+    pr, ab, lv = (int((a.status == x).sum()) for x in ("Present", "Absent", "Leave"))
+    nm = max(n - pr - ab - lv, 0)
+
+    def donut(parts, center, label):
+        tot = sum(v for _, v, _ in parts)
+        acc, stops = 0, []
+        for _, v, col in parts:
+            if v:
+                stops.append(f"{col} {acc / tot * 100:.1f}% {(acc + v) / tot * 100:.1f}%")
+                acc += v
+        bg = ",".join(stops) or "#dfe8e1 0% 100%"
+        leg = "".join(f'<div><span class="dot" style="background:{col}"></span>{nme}'
+                      f'<b style="float:right">{v}</b></div>' for nme, v, col in parts)
+        return (f'<div class="row"><div class="donut" style="background:conic-gradient({bg})"><div>'
+                f'<b>{center}</b>{label}</div></div><div class="leg">{leg}</div></div>')
+
+    kp = [("👥", "Total Employees", n, "#e3f4e8"), ("🧍", "Present Today", pr, "#e3f4e8"),
+          ("🌴", "On Leave", lv, "#fdf1d6"), ("🚫", "Absent", ab, "#fbe3df")]
+    for col_, (ic, lb, v, bg) in zip(st.columns(4), kp):
+        col_.markdown(f'<div class="card kpi"><div class="ic" style="background:{bg}">{ic}</div>'
+                      f'<div><div class="lb">{lb}</div><div class="v">{v}</div></div></div>',
+                      unsafe_allow_html=True)
+    st.write("")
+    c1, c2 = st.columns(2)
+    c1.markdown('<div class="card"><div class="ttl">Attendance Overview</div>' + donut(
+        [("Present", pr, "#2e7d4f"), ("Absent", ab, "#d64933"), ("On Leave", lv, "#f0b429"),
+         ("Not marked", nm, "#cfd8d2")], pr, "Present") + "</div>", unsafe_allow_html=True)
+    lvs = q("SELECT status FROM leaves WHERE start<=? AND end>=?", (str(me), str(m1))).status
+    L = lambda x: int((lvs == x).sum())
+    c2.markdown('<div class="card"><div class="ttl">Leave Overview (this month)</div>' + donut(
+        [("Approved", L("Approved"), "#2e7d4f"), ("Pending", L("Pending"), "#f0b429"),
+         ("Rejected", L("Rejected"), "#d64933")], len(lvs), "Total") + "</div>", unsafe_allow_html=True)
+    st.write("")
+    c3, c4 = st.columns(2)
+    rc = a[a.status == "Present"].sort_values("in_t", ascending=False).head(5)
+    items = "".join(
+        f'<div class="ci"><div class="av">{html.escape(str(r["name"])[:1].upper())}</div>'
+        f'<div><b>{html.escape(str(r["name"]))}</b><br><small>{r.in_t}</small></div>'
+        f'<span class="badge">{r.status}</span></div>' for _, r in rc.iterrows()
+    ) or "<small>No check-ins today yet.</small>"
+    c3.markdown(f'<div class="card"><div class="ttl">Recent Check-ins</div>{items}</div>',
+                unsafe_allow_html=True)
+    vals = []
+    for i in range(5, -1, -1):
+        mm, yy = today().month - i, today().year
+        while mm <= 0:
+            mm, yy = mm + 12, yy - 1
+        s0 = date(yy, mm, 1)
+        e0 = (s0.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        pdf = calc_payroll(str(s0), str(e0), [], [], [], [])
+        vals.append((s0.strftime("%b"), float(pdf.Net.sum()) if len(pdf) else 0.0))
+    mx = max(v for _, v in vals) or 1
+    bars = "".join(f'<div><span style="height:{v / mx * 80:.0f}%"></span>{l}</div>' for l, v in vals)
+    c4.markdown(f'<div class="card"><div class="ttl">Monthly Payroll Summary</div>'
+                f'<small>Net payroll this month</small>'
+                f'<div style="font-size:26px;font-weight:700">{vals[-1][1]:,.0f} {cur_}</div>'
+                f'<div class="bars">{bars}</div></div>', unsafe_allow_html=True)
+    st.write("")
     if len(e):
         st.subheader("Section-wise headcount")
         st.bar_chart(e.groupby("section").size())
