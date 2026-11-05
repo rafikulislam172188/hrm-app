@@ -714,3 +714,200 @@ elif page == "Settings":
                              ot_mult=ot, date_fmt=df_, gosi_pct=gp, gosi_nat=gn, vat_pct=vp, weekend=days.index(wk)).items():
                 q("REPLACE INTO settings VALUES(?,?)", (k, str(v)), fetch=False)
             st.success("Saved"); st.rerun()
+
+
+# =====================================================================================
+# EDIT / DELETE  (paste this whole block at the VERY END of hrm_app.py, no indentation)
+# =====================================================================================
+CAN_EDIT = ("Admin", "HR")      # roles that can edit   (change here if you want)
+CAN_DELETE = ("Admin",)         # roles that can delete (change here if you want)
+
+
+def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used_in=(), cascade=(), key="m",
+           after_upd=None, before_del=None, guard=None):
+    """Inline Edit + Delete grid for any table. `sql` must return `id` plus the columns to show."""
+    can_e, can_d = role in CAN_EDIT, role in CAN_DELETE
+    if not (can_e or can_d):
+        return
+    if st.session_state.get("flash"):
+        st.success(st.session_state.pop("flash"))
+    fks, selects = fks or {}, selects or {}
+    df = q(sql, params)
+    if df.empty:
+        st.info("No records.")
+        return
+    lk = {c: q(f"SELECT id,name FROM {t}") for c, (_, t) in fks.items()}
+    view = df.copy()
+    for c in fks:
+        view[c] = view[c].fillna("")
+    if can_d:
+        view.insert(1, "Delete", False)
+    cfg = {"id": None, **{h: None for h in hide}}
+    for c, t in lk.items():
+        cfg[c] = st.column_config.SelectboxColumn(options=[""] + t.name.tolist())
+    for c, o in selects.items():
+        cfg[c] = st.column_config.SelectboxColumn(options=o)
+    editable = (list(edit) + list(fks)) if can_e else []
+    if can_d:
+        editable.append("Delete")
+    ver = st.session_state.get(key + "v", 0)
+    ed = st.data_editor(view, hide_index=True, use_container_width=True, column_config=cfg,
+                        disabled=[c for c in view.columns if c not in editable], key=f"{key}{ver}")
+
+    def done(msg):
+        st.session_state[key + "v"] = ver + 1
+        st.session_state["flash"] = msg
+        st.rerun()
+
+    if can_e and st.button("💾 Save changes", key=key + "s"):
+        n = 0
+        for i, r in ed.iterrows():
+            o, sets = view.loc[i], {}
+            for c in list(edit) + list(fks):
+                a, b = r[c], o[c]
+                if (pd.isna(a) and pd.isna(b)) or a == b:
+                    continue
+                if c in fks:
+                    t = lk[c]
+                    m = t[t.name == a].id
+                    sets[fks[c][0]] = int(m.iloc[0]) if len(m) else None
+                else:
+                    sets[c] = None if pd.isna(a) else (a.item() if hasattr(a, "item") else a)
+            if sets:
+                try:
+                    q(f"UPDATE {table} SET " + ",".join(f"{k}=?" for k in sets) + " WHERE id=?",
+                      (*sets.values(), int(r["id"])), fetch=False)
+                    if after_upd:
+                        after_upd(o, r)
+                    n += 1
+                except Exception as ex:
+                    st.error(f"Row {int(r['id'])}: {ex}")
+                    return
+        done(f"{n} row(s) updated")
+
+    if can_d:
+        sel = ed[ed["Delete"] == True]  # noqa: E712
+        if len(sel):
+            ok = st.checkbox(f"Yes, permanently delete {len(sel)} selected row(s)"
+                             + (" together with their attendance, leave, adjustments and costs" if cascade else ""),
+                             key=key + "ck")
+            if st.button("🗑 Delete ticked rows", key=key + "d"):
+                if not ok:
+                    st.warning("Tick the confirm box first.")
+                else:
+                    errs, n = [], 0
+                    for _, r in sel.iterrows():
+                        i = int(r["id"])
+                        msg = guard(r) if guard else None
+                        busy = [t for t, c in used_in if q(f"SELECT COUNT(*) AS n FROM {t} WHERE {c}=?", (i,)).n[0]]
+                        if msg or busy:
+                            errs.append(msg or f"id {i} is still used in '{busy[0]}' - reassign it first")
+                            continue
+                        if before_del:
+                            before_del(r)
+                        for t, c in cascade:
+                            q(f"DELETE FROM {t} WHERE {c}=?", (i,), fetch=False)
+                        q(f"DELETE FROM {table} WHERE id=?", (i,), fetch=False)
+                        n += 1
+                    if n:
+                        done(f"{n} row(s) deleted" + (" | skipped: " + " | ".join(errs) if errs else ""))
+                    else:
+                        st.error(" | ".join(errs))
+
+
+def dr(key):
+    c = st.columns(2)
+    return (str(c[0].date_input("From", today().replace(day=1), key=key + "1")),
+            str(c[1].date_input("To", today(), key=key + "2")))
+
+
+def lv_clear(r):  # remove the attendance rows an approved leave created
+    if r["status"] == "Approved":
+        q("DELETE FROM attendance WHERE emp_id=? AND status IN ('Leave','Absent') AND day BETWEEN ? AND ?",
+          (int(r["emp_id"]), r["start"], r["end"]), fetch=False)
+
+
+def lv_sync(o, r):  # after editing a leave: recalc days and rebuild its attendance rows
+    s0, e0 = pd.to_datetime(r["start"]), pd.to_datetime(r["end"])
+    days = int((e0 - s0).days + 1)
+    q("UPDATE leaves SET days=? WHERE id=?", (days, int(r["id"])), fetch=False)
+    if r["status"] == "Approved":
+        lv_clear(o)
+        for k in range(days):
+            q("INSERT INTO attendance(emp_id,day,status,hours) VALUES(?,?,?,0) ON CONFLICT(emp_id,day) "
+              "DO UPDATE SET status=excluded.status",
+              (int(r["emp_id"]), str(s0.date() + timedelta(k)), "Absent" if r["ltype"] == "Unpaid" else "Leave"),
+              fetch=False)
+
+
+if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Setup", "Attendance", "Leave", "Adjustments", "Costs", "Users"):
+    st.divider()
+    st.subheader("✏️ Edit / 🗑 Delete")
+    st.caption("Change cells then press Save. To delete: tick 'Delete', confirm, press Delete. Dates are YYYY-MM-DD.")
+
+    if page == "Employees":
+        sq = st.text_input("Search code / name", key="emsq")
+        manage("employees", """SELECT e.id, e.code, e.name, c.name AS company, d.name AS section, s.name AS sponsor,
+            e.labour_type, e.pay_type, e.pay_mode, e.rate, e.food_allow, e.ot_rate, e.bill_rate, e.nationality,
+            e.id_no, e.phone, e.join_date, e.id_expiry, e.active FROM employees e
+            LEFT JOIN companies c ON c.id=e.company_id LEFT JOIN departments d ON d.id=e.dept_id
+            LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE e.code LIKE ? OR e.name LIKE ? ORDER BY e.code""",
+               (f"%{sq}%", f"%{sq}%"),
+               edit=["code", "name", "labour_type", "pay_type", "pay_mode", "rate", "food_allow", "ot_rate", "bill_rate",
+                     "nationality", "id_no", "phone", "join_date", "id_expiry", "active"],
+               fks={"company": ("company_id", "companies"), "section": ("dept_id", "departments"),
+                    "sponsor": ("sponsor_id", "sponsors")},
+               selects={"labour_type": ["Company", "Outside"], "pay_type": ["Monthly", "Hourly"],
+                        "pay_mode": ["Bank", "Cash"], "active": [1, 0]},
+               cascade=[("attendance", "emp_id"), ("leaves", "emp_id"), ("adjustments", "emp_id"), ("costs", "emp_id")],
+               key="emp")
+
+    elif page == "Setup":
+        t1, t2, t3 = st.tabs(["Companies", "Sections", "Sponsors / Kofil"])
+        with t1:
+            manage("companies", "SELECT id, name, vat FROM companies ORDER BY name", edit=["name", "vat"],
+                   used_in=[("employees", "company_id"), ("attendance", "company_id"), ("costs", "company_id")], key="mco")
+        with t2:
+            manage("departments", "SELECT id, name FROM departments ORDER BY name", edit=["name"],
+                   used_in=[("employees", "dept_id"), ("attendance", "dept_id")], key="mse")
+        with t3:
+            manage("sponsors", "SELECT id, name, phone FROM sponsors ORDER BY name", edit=["name", "phone"],
+                   used_in=[("employees", "sponsor_id")], key="msp")
+
+    elif page == "Attendance":
+        a1, a2 = dr("mat")
+        sq = st.text_input("Search code / name", key="masq")
+        manage("attendance", """SELECT a.id, a.day, e.code, e.name AS employee, a.status, a.in_t, a.out_t, a.hours
+            FROM attendance a JOIN employees e ON e.id=a.emp_id WHERE a.day BETWEEN ? AND ?
+            AND (e.code LIKE ? OR e.name LIKE ?) ORDER BY a.day DESC, e.code""", (a1, a2, f"%{sq}%", f"%{sq}%"),
+               edit=["status", "in_t", "out_t", "hours"], selects={"status": ["Present", "Absent", "Leave", "Off"]}, key="att")
+
+    elif page == "Leave":
+        manage("leaves", """SELECT l.id, l.emp_id, e.code, e.name AS employee, l.ltype, l.start, l.end, l.days, l.status
+            FROM leaves l JOIN employees e ON e.id=l.emp_id ORDER BY l.start DESC""",
+               edit=["ltype", "start", "end"], hide=("emp_id",),
+               selects={"ltype": ["Annual", "Sick", "Emergency", "Unpaid", "Other"]},
+               after_upd=lv_sync, before_del=lv_clear, key="lv")
+
+    elif page == "Adjustments":
+        a1, a2 = dr("mad")
+        manage("adjustments", """SELECT a.id, a.day, e.code, e.name AS employee, a.kind, a.amount, a.note
+            FROM adjustments a JOIN employees e ON e.id=a.emp_id WHERE a.day BETWEEN ? AND ? ORDER BY a.day DESC""",
+               (a1, a2), edit=["day", "kind", "amount", "note"],
+               selects={"kind": ["Advance", "Deduction", "Bonus", "Allowance", "Supervisor/Operator", "Foundation Day",
+                                 "Skill/Villa", "Extra", "Eid Bonus"]}, key="adj")
+
+    elif page == "Costs":
+        a1, a2 = dr("mco")
+        manage("costs", """SELECT x.id, x.day, x.category, e.code, c.name AS company, x.amount, x.note FROM costs x
+            LEFT JOIN employees e ON e.id=x.emp_id LEFT JOIN companies c ON c.id=x.company_id
+            WHERE x.day BETWEEN ? AND ? ORDER BY x.day DESC""", (a1, a2),
+               edit=["day", "category", "amount", "note"], fks={"company": ("company_id", "companies")},
+               selects={"category": ["ID / Iqama (Juazat)", "Work permit", "Insurance", "Transfer", "Muqeem / Monduf fee",
+                                     "Exit re-entry", "Passport", "Medical", "Vacation ticket", "GOSI", "Other"]}, key="cst")
+
+    elif page == "Users":
+        manage("users", "SELECT id, username, role FROM users ORDER BY username", edit=["username", "role"],
+               selects={"role": ["Admin", "HR", "Manager"]},
+               guard=lambda r: "You cannot delete the user you are logged in as"
+               if r["username"] == st.session_state.user else None, key="usr")
