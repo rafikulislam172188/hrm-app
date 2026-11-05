@@ -1,7 +1,7 @@
 """International HRM - Streamlit + SQLite
 Run: pip install streamlit pandas && streamlit run hrm_app.py
 """
-import sqlite3, hashlib, io, html
+import sqlite3, hashlib, io, html, calendar
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, available_timezones
 import pandas as pd
@@ -49,6 +49,18 @@ def q(sql, p=(), fetch=True):
 
 def pw(p):
     return hashlib.sha256(("hrm$" + p).encode()).hexdigest()
+
+
+def ot_rate_of(rate, pay_type, ot_rate, ref):
+    """OT rate/hour: the employee's own OT rate, else hourly rate (Hourly) or daily rate/std hrs x multiplier (Monthly)."""
+    if ot_rate and ot_rate > 0:
+        return round(ot_rate, 2)
+    if pay_type != "Monthly":
+        return round(rate, 2)
+    d = date.fromisoformat(ref)
+    n = calendar.monthrange(d.year, d.month)[1]
+    wd_m = n - sum(date(d.year, d.month, k).weekday() == int(S("weekend")) for k in range(1, n + 1))
+    return round(rate / wd_m / float(S("std_hours")) * float(S("ot_mult")), 2)
 
 
 def eosb(r, upto):
@@ -145,7 +157,7 @@ def save_emp(d):
 
 
 def filters(key):
-    """Every page: custom date range + Company / Section / Labour / Pay type / Sponsor(Kofil) filters."""
+    """Every page: custom date range + Company / Section / Labour / Pay type / Sponsor(Kofil) filters + search."""
     c = st.columns(3)
     d1 = c[0].date_input("From", today().replace(day=1), key=key + "a")
     d2 = c[1].date_input("To", today(), key=key + "b")
@@ -155,19 +167,55 @@ def filters(key):
     lt = c[1].multiselect("Labour", ["Company", "Outside"], key=key + "d")
     pt = c[2].multiselect("Pay type", ["Monthly", "Hourly"], key=key + "e")
     spn = c[3].multiselect("Sponsor / Kofil", q("SELECT name FROM sponsors").name.tolist(), key=key + "f")
-    return str(d1), str(d2), sec, lt, pt, spn, co
+    qs = st.text_input("🔎 Search code / name", key=key + "h")
+    return str(d1), str(d2), sec, lt, pt, spn, co, qs
 
 
-def apply_f(df, sec=(), lt=(), pt=(), spn=(), co=()):
+def apply_f(df, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
     for col, v in (("section", sec), ("labour_type", lt), ("pay_type", pt), ("sponsor", spn), ("company", co)):
         if v and col in df:
             df = df[df[col].isin(v)]
+    cols = [c for c in ("code", "name", "employee") if c in df]
+    if qs and cols:
+        m = pd.Series(False, index=df.index)
+        for c in cols:
+            m |= df[c].astype(str).str.contains(qs, case=False, na=False, regex=False)
+        df = df[m]
     return df
 
 
+def df_pdf(df, title):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A3, A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    b, n = io.BytesIO(), max(len(df.columns), 1)
+    ps = landscape(A3 if n > 18 else A4)
+    doc = SimpleDocTemplate(b, pagesize=ps, leftMargin=20, rightMargin=20, topMargin=20, bottomMargin=20)
+    fs = 8 if n <= 10 else (7 if n <= 18 else 6)
+    w = (ps[0] - 40) / n
+    cut = max(4, int(w / (fs * 0.52)))
+    fmt = lambda v: "" if pd.isna(v) else (f"{v:,.2f}" if isinstance(v, float) else str(v))[:cut]
+    data = [[str(c)[:cut] for c in df.columns]] + [[fmt(v) for v in row] for row in df.itertuples(index=False)]
+    t = Table(data, colWidths=[w] * n, repeatRows=1)
+    t.setStyle(TableStyle([("FONTSIZE", (0, 0), (-1, -1), fs), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#14472f")),
+                           ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                           ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#eef5ef")])]))
+    sty = getSampleStyleSheet()
+    doc.build([Paragraph(f"{S('company')} - {title}", sty["Title"]),
+               Paragraph(f"Generated {today()}  |  {len(df)} rows", sty["Normal"]), Spacer(1, 8), t])
+    return b.getvalue()
+
+
 def download(df, name):
-    st.download_button("⬇ Download CSV", df.to_csv(index=False).encode("utf-8-sig"),
-                       f"{name}_{today()}.csv", "text/csv")
+    c = st.columns([1, 1, 6])
+    c[0].download_button("⬇ CSV", df.to_csv(index=False).encode("utf-8-sig"), f"{name}_{today()}.csv", "text/csv",
+                         key="csv_" + name)
+    try:
+        c[1].download_button("⬇ PDF", df_pdf(df, name.replace("_", " ")), f"{name}_{today()}.pdf", "application/pdf",
+                             key="pdf_" + name)
+    except ImportError:
+        c[1].caption("pip install reportlab")
 
 
 PCOLS = ["Code", "Name", "Company", "Section", "Sponsor", "Labour", "Pay", "Mode", "Rate", "Days", "Leave", "Absent",
@@ -175,9 +223,9 @@ PCOLS = ["Code", "Name", "Company", "Section", "Sponsor", "Labour", "Pay", "Mode
          "GOSI", "Net", "Bank", "Cash", "Invoice"]
 
 
-def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=()):
+def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
     """Per employee x company x section (from daily attendance), for any date range."""
-    e = apply_f(emp_df(), (), lt, pt, spn)
+    e = apply_f(emp_df(), (), lt, pt, spn, (), qs)
     att = q("SELECT * FROM attendance WHERE day BETWEEN ? AND ?", (d1, d2))
     adj = q("SELECT * FROM adjustments WHERE day BETWEEN ? AND ?", (d1, d2))
     cn = dict(q("SELECT id,name FROM companies").values)
@@ -202,27 +250,36 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=()):
             nor = pres.drop(wkd.index)
             ot_h, wk_h = nor.ot_hours.sum(), (wkd.hours + wkd.ot_hours).sum()
             reg_h = nor.hours.sum()
-            ld, off = (g.status == "Leave").sum(), (g.status == "Off").sum()
+            ld = (g.status == "Leave").sum()
+            g = g.assign(m=g.day.str[:7], wk=pd.to_datetime(g.day).dt.weekday == we)
             if r.pay_type == "Monthly":
-                hr = r.rate / wd / std
-                basic = min(r.rate / wd * (len(nor) + ld), r.rate * months)
-                otr = r.ot_rate if r.ot_rate > 0 else hr * otm
+                # salary / (days in that month - weekend days) per paid day; weekend work = OT only
+                basic = ot_pay = wk_pay = 0.0
+                for mth, gm in g.groupby("m"):
+                    y_, m_ = int(mth[:4]), int(mth[5:])
+                    nd_ = calendar.monthrange(y_, m_)[1]
+                    wd_m = nd_ - sum(date(y_, m_, k).weekday() == we for k in range(1, nd_ + 1))
+                    otr = r.ot_rate if r.ot_rate > 0 else r.rate / wd_m / std * otm
+                    p_, w_ = gm[(gm.status == "Present") & ~gm.wk], gm[(gm.status == "Present") & gm.wk]
+                    basic += r.rate / wd_m * (len(p_) + len(gm[(gm.status == "Leave") & ~gm.wk]))
+                    ot_pay += p_.ot_hours.sum() * otr
+                    wk_pay += (w_.hours + w_.ot_hours).sum() * otr
                 food = r.food_allow * months * len(pres) / tp
-            elif r.ot_rate > 0:     # Hourly with its own OT rate: normal hrs x rate, OT/weekend hrs x OT rate
-                basic, otr, food = reg_h * r.rate, r.ot_rate, 0
+            elif r.ot_rate > 0:     # Hourly with its own OT rate
+                basic, ot_pay, wk_pay, food = reg_h * r.rate, ot_h * r.ot_rate, wk_h * r.ot_rate, 0
             else:                   # Hourly: no month basis, all hours worked x rate
-                basic, otr, food = (reg_h + ot_h + wk_h) * r.rate, 0, 0
+                basic, ot_pay, wk_pay, food = (reg_h + ot_h + wk_h) * r.rate, 0, 0, 0
             add = ad[~ad.kind.isin(["Advance", "Deduction"])].amount.sum() if first else 0
             adv = ad[ad.kind == "Advance"].amount.sum() if first else 0
             ded = ad[ad.kind == "Deduction"].amount.sum() if first else 0
             first = False
             gosi = basic * gp / 100 if str(r.nationality).strip().lower() == gn else 0
-            net = basic + food + (ot_h + wk_h) * otr + add - adv - ded - gosi
+            net = basic + food + ot_pay + wk_pay + add - adv - ded - gosi
             rows.append({"Code": r.code, "Name": r["name"], "Company": nm(cn, cid), "Section": nm(sn, sid),
                          "Sponsor": r.sponsor or "-", "Labour": r.labour_type, "Pay": r.pay_type, "Mode": r.pay_mode,
                          "Rate": r.rate, "Days": len(pres), "Leave": ld, "Absent": (g.status == "Absent").sum(),
                          "Hours": (pres.hours + pres.ot_hours).sum(), "OT Hrs": ot_h, "Wknd Hrs": wk_h, "Basic": basic, "Food": food,
-                         "OT Pay": ot_h * otr, "Wknd OT": wk_h * otr, "Allowances": add, "Advance": adv,
+                         "OT Pay": ot_pay, "Wknd OT": wk_pay, "Allowances": add, "Advance": adv,
                          "Deduction": ded, "GOSI": gosi, "Net": net, "Bank": net if r.pay_mode == "Bank" else 0,
                          "Cash": net if r.pay_mode != "Bank" else 0, "Invoice": (pres.hours + pres.ot_hours).sum() * r.bill_rate})
     df = pd.DataFrame(rows, columns=PCOLS).round(2)
@@ -406,10 +463,11 @@ elif page == "Attendance":
     c = st.columns(3)
     day = c[0].date_input("Date", today())
     fco, fsec = c[1].multiselect("Company", list(cn.values())), c[2].multiselect("Section", list(sn.values()))
-    c = st.columns(2)
+    c = st.columns(3)
     fspn = c[0].multiselect("Sponsor / Kofil", sp.name.tolist())
+    qs = c[2].text_input("🔎 Search code / name")
     fst = c[1].multiselect("Status filter (as saved for this date)", ["P", "A", "L", "O", "Not marked"])
-    e = apply_f(emp_df(), fsec, (), (), fspn, fco)
+    e = apply_f(emp_df(), fsec, (), (), fspn, fco, qs)
     old = q("SELECT * FROM attendance WHERE day=?", (str(day),))
     dn, do_ = float(S("def_normal")), float(S("def_ot"))
     wkend = day.weekday() == int(S("weekend"))
@@ -427,13 +485,13 @@ elif page == "Attendance":
         rows.append({"id": r.id, "Code": r.code, "Name": r["name"], "Labour": r.labour_type, "Sponsor": r.sponsor or "",
                      "Company": nm(g("company_id", None), cn) or (r.company or ""),
                      "Section": nm(g("dept_id", None), sn) or (r.section or ""),
-                     "Status": stt, "Normal Hrs": float(g("hours", dn)) if sv else dn,
+                     "OT Rate": ot_rate_of(r.rate, r.pay_type, r.ot_rate, str(day)), "Status": stt, "Normal Hrs": float(g("hours", dn)) if sv else dn,
                      "OT Hrs": float(g("ot_hours", 0.0)) if sv else do_})
     if wkend:
         st.info("This date is the weekend day: everyone starts as O (no work, no pay). Change to P only for those who "
                 "worked - all their hours are then paid as OT.")
     ed = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True,
-                        key=f"att{day}{fco}{fsec}{fspn}{fst}", disabled=["id", "Code", "Name", "Labour", "Sponsor"],
+                        key=f"att{day}{fco}{fsec}{fspn}{fst}{qs}", disabled=["id", "Code", "Name", "Labour", "Sponsor", "OT Rate"],
                         column_config={"id": None,
                                        "Company": st.column_config.SelectboxColumn(options=[""] + list(cn.values())),
                                        "Section": st.column_config.SelectboxColumn(options=[""] + list(sn.values())),
@@ -468,12 +526,12 @@ elif page == "Leave":
                 eid = int(e[e.code == x.split(" - ")[0]].id.iloc[0])
                 q("INSERT INTO leaves(emp_id,ltype,start,end,days,status) VALUES(?,?,?,?,?,'Pending')",
                   (eid, lt, str(a), str(b), (b - a).days + 1), fetch=False); st.rerun()
-    d1, d2, sec, lt, pt, spn, co = filters("lv")
+    d1, d2, sec, lt, pt, spn, co, qs = filters("lv")
     df = q("""SELECT l.id, e.code, e.name, c.name AS company, d.name AS section, s.name AS sponsor, e.labour_type, e.pay_type,
         l.ltype, l.start, l.end, l.days, l.status FROM leaves l JOIN employees e ON e.id=l.emp_id
         LEFT JOIN departments d ON d.id=e.dept_id LEFT JOIN sponsors s ON s.id=e.sponsor_id LEFT JOIN companies c ON c.id=e.company_id
         WHERE l.start<=? AND l.end>=?""", (d2, d1))
-    df = apply_f(df, sec, lt, pt, spn, co)
+    df = apply_f(df, sec, lt, pt, spn, co, qs)
     st.dataframe(df, use_container_width=True, hide_index=True); download(df, "leave")
     pend = df[df.status == "Pending"]
     if len(pend):
@@ -692,19 +750,28 @@ elif page == "Reports":
         df = apply_f(df, *f[2:])
     elif kind == "Attendance sheet (P/A/L)":
         df = q("""SELECT e.code, e.name, COALESCE(c.name,c0.name,'-') AS company, COALESCE(d.name,d0.name,'-') AS section,
-            s.name AS sponsor, e.labour_type, e.pay_type, a.day, a.status, a.hours, COALESCE(a.ot_hours,0) AS ot
-            FROM attendance a JOIN employees e ON e.id=a.emp_id
+            s.name AS sponsor, e.labour_type, e.pay_type, e.rate AS rate, e.ot_rate AS ot_rate, a.day, a.status, a.hours,
+            COALESCE(a.ot_hours,0) AS ot FROM attendance a JOIN employees e ON e.id=a.emp_id
             LEFT JOIN companies c ON c.id=a.company_id LEFT JOIN companies c0 ON c0.id=e.company_id
             LEFT JOIN departments d ON d.id=a.dept_id LEFT JOIN departments d0 ON d0.id=e.dept_id
             LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE a.day BETWEEN ? AND ?""", (d1, d2))
         df = apply_f(df, *f[2:])
         if len(df):
+            wk = pd.to_datetime(df.day).dt.weekday == int(S("weekend"))
+            pre, hh = df.status == "Present", df.hours.fillna(0)
+            df["nh"] = hh.where(pre & ~wk, 0)
+            df["oh"] = df.ot.where(pre & ~wk, 0) + (hh + df.ot).where(pre & wk, 0)
             df["c"], df["d"] = df.status.map(CODE).fillna("?"), df.day.str[5:]
+            rt = {x.code: ot_rate_of(x.rate, x.pay_type, x.ot_rate, d2) for x in df.drop_duplicates("code").itertuples()}
             ix = ["code", "name", "company", "section"]
             grid = df.pivot_table(index=ix, columns="d", values="c", aggfunc="first").fillna("")
             tot = df.groupby(ix).agg(P=("c", lambda x: (x == "P").sum()), A=("c", lambda x: (x == "A").sum()),
-                                     L=("c", lambda x: (x == "L").sum()), Normal_Hrs=("hours", "sum"), OT_Hrs=("ot", "sum"))
+                                     L=("c", lambda x: (x == "L").sum()), Normal_Hrs=("nh", "sum"), OT_Hrs=("oh", "sum"))
+            tot["OT_Rate"] = [rt[i[0]] for i in tot.index]
+            tot["OT_Amount"] = (tot.OT_Hrs * tot.OT_Rate).round(2)
             df = grid.join(tot).reset_index()
+            if role == "Manager":
+                df = df.drop(columns=["OT_Rate", "OT_Amount"])
     elif kind == "ID / Iqama expiry":
         e = apply_f(emp_df(), *f[2:])
         x = e.id_expiry.fillna("")
@@ -742,7 +809,7 @@ elif page == "Settings":
         tzs = sorted(available_timezones())
         tz = st.selectbox("Time zone", tzs, tzs.index(S("timezone")))
         sh = st.number_input("Standard hours/day", 1.0, 24.0, float(S("std_hours")))
-        wd = st.number_input("Working days/month = monthly salary divisor (26 if the weekend day is unpaid)", 1.0, 31.0, float(S("work_days")))
+        wd = st.number_input("Working days/month (only for EOSB of hourly staff; monthly salary days are automatic)", 1.0, 31.0, float(S("work_days")))
         ot = st.number_input("Overtime multiplier", 1.0, 5.0, float(S("ot_mult")))
         df_ = st.selectbox("Date format", ["%d-%m-%Y", "%Y-%m-%d", "%m/%d/%Y"])
         gp = st.number_input("GOSI employee deduction % (0 = off)", 0.0, 100.0, float(S("gosi_pct")))
@@ -776,6 +843,9 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
         st.success(st.session_state.pop("flash"))
     fks, selects = fks or {}, selects or {}
     df = q(sql, params)
+    sq_ = st.text_input("🔎 Search", key=key + "q")
+    if sq_ and not df.empty:
+        df = df[df.astype(str).apply(lambda col: col.str.contains(sq_, case=False, regex=False)).any(axis=1)].reset_index(drop=True)
     if df.empty:
         st.info("No records.")
         return
@@ -795,7 +865,7 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
         editable.append("Delete")
     ver = st.session_state.get(key + "v", 0)
     ed = st.data_editor(view, hide_index=True, use_container_width=True, column_config=cfg,
-                        disabled=[c for c in view.columns if c not in editable], key=f"{key}{ver}")
+                        disabled=[c for c in view.columns if c not in editable], key=f"{key}{ver}{sq_}")
 
     def done(msg):
         st.session_state[key + "v"] = ver + 1
@@ -889,13 +959,11 @@ if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Setup", "Attendance"
     st.caption("Change cells then press Save. To delete: tick 'Delete', confirm, press Delete. Dates are YYYY-MM-DD.")
 
     if page == "Employees":
-        sq = st.text_input("Search code / name", key="emsq")
         manage("employees", """SELECT e.id, e.code, e.name, c.name AS company, d.name AS section, s.name AS sponsor,
             e.labour_type, e.pay_type, e.pay_mode, e.rate, e.food_allow, e.ot_rate, e.bill_rate, e.nationality,
             e.id_no, e.phone, e.join_date, e.id_expiry, e.active FROM employees e
             LEFT JOIN companies c ON c.id=e.company_id LEFT JOIN departments d ON d.id=e.dept_id
-            LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE e.code LIKE ? OR e.name LIKE ? ORDER BY e.code""",
-               (f"%{sq}%", f"%{sq}%"),
+            LEFT JOIN sponsors s ON s.id=e.sponsor_id ORDER BY e.code""",
                edit=["code", "name", "labour_type", "pay_type", "pay_mode", "rate", "food_allow", "ot_rate", "bill_rate",
                      "nationality", "id_no", "phone", "join_date", "id_expiry", "active"],
                fks={"company": ("company_id", "companies"), "section": ("dept_id", "departments"),
@@ -919,10 +987,9 @@ if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Setup", "Attendance"
 
     elif page == "Attendance":
         a1, a2 = dr("mat")
-        sq = st.text_input("Search code / name", key="masq")
         manage("attendance", """SELECT a.id, a.day, e.code, e.name AS employee, a.status, a.hours, a.ot_hours
             FROM attendance a JOIN employees e ON e.id=a.emp_id WHERE a.day BETWEEN ? AND ?
-            AND (e.code LIKE ? OR e.name LIKE ?) ORDER BY a.day DESC, e.code""", (a1, a2, f"%{sq}%", f"%{sq}%"),
+            ORDER BY a.day DESC, e.code""", (a1, a2),
                edit=["status", "hours", "ot_hours"], selects={"status": ["Present", "Absent", "Leave", "Off"]}, key="att")
 
     elif page == "Leave":
