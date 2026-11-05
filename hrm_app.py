@@ -64,9 +64,10 @@ def payslip_pdf(r, d1, d2):
     y = 800
     c.setFont("Helvetica-Bold", 16); c.drawString(50, y, f"{S('company')} - PAYSLIP"); y -= 25
     c.setFont("Helvetica", 11); c.drawString(50, y, f"Period: {d1} to {d2}"); y -= 30
-    money = {"Rate", "Basic", "OT Pay", "Allow/Bonus", "Advance", "Deduction", "GOSI", "Net"}
-    for k in ["Code", "Name", "Section", "Labour", "Sponsor", "Pay", "Rate", "Present", "Leave", "Absent",
-              "Hours", "OT Hrs", "Basic", "OT Pay", "Allow/Bonus", "Advance", "Deduction", "GOSI", "Net"]:
+    money = {"Rate", "Basic", "Food", "OT Pay", "Wknd OT", "Allowances", "Advance", "Deduction", "GOSI", "Net"}
+    for k in r.index:
+        if k in ("Invoice", "Bank", "Cash"):
+            continue
         c.setFont("Helvetica-Bold" if k == "Net" else "Helvetica", 11)
         c.drawString(50, y, k)
         c.drawString(250, y, f"{r[k]}" + (f" {S('currency')}" if k in money else ""))
@@ -93,13 +94,18 @@ def init():
     ]:
         q(s, fetch=False)
     defaults = {"company": "My Company", "currency": "SAR", "timezone": "Asia/Riyadh",
-                "std_hours": "8", "work_days": "30", "ot_mult": "1.5", "date_fmt": "%d-%m-%Y", "gosi_pct": "0", "gosi_nat": "Saudi"}
+                "std_hours": "8", "work_days": "30", "ot_mult": "1.5", "date_fmt": "%d-%m-%Y", "gosi_pct": "0", "gosi_nat": "Saudi", "vat_pct": "15", "weekend": "4"}
     for k, v in defaults.items():
         q("INSERT OR IGNORE INTO settings VALUES(?,?)", (k, v), fetch=False)
-    try:
-        q("ALTER TABLE employees ADD COLUMN id_expiry TEXT", fetch=False)
-    except Exception:
-        pass
+    q("CREATE TABLE IF NOT EXISTS companies(id INTEGER PRIMARY KEY, name TEXT UNIQUE, vat TEXT)", fetch=False)
+    q("CREATE TABLE IF NOT EXISTS costs(id INTEGER PRIMARY KEY, day TEXT, category TEXT, emp_id INT, company_id INT, amount REAL, note TEXT)", fetch=False)
+    for t_, c_ in [("employees", "id_expiry TEXT"), ("employees", "company_id INT"), ("employees", "food_allow REAL DEFAULT 0"),
+                   ("employees", "ot_rate REAL DEFAULT 0"), ("employees", "bill_rate REAL DEFAULT 0"),
+                   ("employees", "pay_mode TEXT DEFAULT 'Bank'"), ("attendance", "company_id INT"), ("attendance", "dept_id INT")]:
+        try:
+            q(f"ALTER TABLE {t_} ADD COLUMN {c_}", fetch=False)
+        except Exception:
+            pass
     if q("SELECT COUNT(*) AS n FROM users").n[0] == 0:
         q("INSERT INTO users(username,pw,role) VALUES(?,?,?)", ("admin", pw("admin123"), "Admin"), fetch=False)
 
@@ -123,31 +129,37 @@ def hrs(i, o):
 
 
 def emp_df(active=True):
-    return q("""SELECT e.id, e.code, e.name, d.name AS section, s.name AS sponsor, e.labour_type,
-        e.pay_type, e.rate, e.nationality, e.id_no, e.phone, e.join_date, e.id_expiry
-        FROM employees e LEFT JOIN departments d ON d.id=e.dept_id
+    return q("""SELECT e.id, e.code, e.name, c.name AS company, d.name AS section, s.name AS sponsor, e.labour_type,
+        e.pay_type, e.pay_mode, e.rate, e.food_allow, e.ot_rate, e.bill_rate, e.nationality, e.id_no, e.phone,
+        e.join_date, e.id_expiry, e.company_id, e.dept_id, e.sponsor_id
+        FROM employees e LEFT JOIN companies c ON c.id=e.company_id LEFT JOIN departments d ON d.id=e.dept_id
         LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE e.active=?""", (1 if active else 0,))
 
 
+def save_emp(d):
+    cols = list(d)
+    q(f"INSERT INTO employees({','.join(cols)}) VALUES({','.join('?' * len(cols))}) ON CONFLICT(code) DO UPDATE SET "
+      + ",".join(f"{k}=excluded.{k}" for k in cols if k != "code"), tuple(d.values()), fetch=False)
+
+
 def filters(key):
-    """Common filter bar used in every report/page: date range, section, labour type, pay type, sponsor."""
-    c = st.columns(5)
+    """Every page: custom date range + Company / Section / Labour / Pay type / Sponsor(Kofil) filters."""
+    c = st.columns(3)
     d1 = c[0].date_input("From", today().replace(day=1), key=key + "a")
     d2 = c[1].date_input("To", today(), key=key + "b")
-    secs = q("SELECT name FROM departments").name.tolist()
-    sp = q("SELECT name FROM sponsors").name.tolist()
-    sec = c[2].multiselect("Section", secs, key=key + "c")
-    lt = c[3].multiselect("Labour", ["Company", "Outside"], key=key + "d")
-    pt = c[4].multiselect("Pay type", ["Monthly", "Hourly"], key=key + "e")
-    spn = st.multiselect("Sponsor / Kafeel / Agency", sp, key=key + "f")
-    return str(d1), str(d2), sec, lt, pt, spn
+    co = c[2].multiselect("Company", q("SELECT name FROM companies").name.tolist(), key=key + "g")
+    c = st.columns(4)
+    sec = c[0].multiselect("Section", q("SELECT name FROM departments").name.tolist(), key=key + "c")
+    lt = c[1].multiselect("Labour", ["Company", "Outside"], key=key + "d")
+    pt = c[2].multiselect("Pay type", ["Monthly", "Hourly"], key=key + "e")
+    spn = c[3].multiselect("Sponsor / Kofil", q("SELECT name FROM sponsors").name.tolist(), key=key + "f")
+    return str(d1), str(d2), sec, lt, pt, spn, co
 
 
-def apply_f(df, sec, lt, pt, spn):
-    if sec: df = df[df.section.isin(sec)]
-    if lt: df = df[df.labour_type.isin(lt)]
-    if pt: df = df[df.pay_type.isin(pt)]
-    if spn: df = df[df.sponsor.isin(spn)]
+def apply_f(df, sec=(), lt=(), pt=(), spn=(), co=()):
+    for col, v in (("section", sec), ("labour_type", lt), ("pay_type", pt), ("sponsor", spn), ("company", co)):
+        if v and col in df:
+            df = df[df[col].isin(v)]
     return df
 
 
@@ -156,38 +168,62 @@ def download(df, name):
                        f"{name}_{today()}.csv", "text/csv")
 
 
-def calc_payroll(d1, d2, sec, lt, pt, spn):
-    e = apply_f(emp_df(), sec, lt, pt, spn)
+PCOLS = ["Code", "Name", "Company", "Section", "Sponsor", "Labour", "Pay", "Mode", "Rate", "Days", "Leave", "Absent",
+         "Hours", "OT Hrs", "Wknd Hrs", "Basic", "Food", "OT Pay", "Wknd OT", "Allowances", "Advance", "Deduction",
+         "GOSI", "Net", "Bank", "Cash", "Invoice"]
+
+
+def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=()):
+    """Per employee x company x section (from daily attendance), for any date range."""
+    e = apply_f(emp_df(), (), lt, pt, spn)
     att = q("SELECT * FROM attendance WHERE day BETWEEN ? AND ?", (d1, d2))
-    std, wd, otm = float(S("std_hours")), float(S("work_days")), float(S("ot_mult"))
     adj = q("SELECT * FROM adjustments WHERE day BETWEEN ? AND ?", (d1, d2))
+    cn = dict(q("SELECT id,name FROM companies").values)
+    sn = dict(q("SELECT id,name FROM departments").values)
+    nm = lambda d, k: d.get(int(k), "-") if pd.notna(k) else "-"
+    std, otm, wd, we = float(S("std_hours")), float(S("ot_mult")), float(S("work_days")), int(S("weekend"))
     gp, gn = float(S("gosi_pct")), S("gosi_nat").strip().lower()
+    months = max(1, round(((date.fromisoformat(d2) - date.fromisoformat(d1)).days + 1) / 30.4))
     rows = []
     for _, r in e.iterrows():
-        a = att[att.emp_id == r.id]
-        pres = a[a.status == "Present"]
-        pd_, ld = len(pres), len(a[a.status == "Leave"])
-        tot = pres.hours.sum()
-        ot = (pres.hours - std).clip(lower=0).sum()
-        reg = tot - ot
-        if r.pay_type == "Monthly":
-            daily = r.rate / wd
-            basic, hr = daily * (pd_ + ld + len(a[a.status == "Off"])), daily / std
-        else:
-            basic, hr = reg * r.rate, r.rate
-        otp = ot * hr * otm
+        a = att[att.emp_id == r.id].copy()
+        if a.empty:
+            continue
+        a["cid"], a["sid"] = a.company_id.fillna(r.company_id), a.dept_id.fillna(r.dept_id)
         ad = adj[adj.emp_id == r.id]
-        add = ad[ad.kind.isin(["Bonus", "Allowance"])].amount.sum()
-        adv = ad[ad.kind == "Advance"].amount.sum()
-        ded = ad[ad.kind == "Deduction"].amount.sum()
-        gosi = basic * gp / 100 if str(r.nationality).strip().lower() == gn else 0
-        rows.append({"Code": r.code, "Name": r["name"], "Section": r.section, "Labour": r.labour_type,
-                     "Sponsor": r.sponsor, "Pay": r.pay_type, "Rate": r.rate, "Present": pd_,
-                     "Leave": ld, "Absent": len(a[a.status == "Absent"]), "Hours": round(tot, 2),
-                     "OT Hrs": round(ot, 2), "Basic": round(basic, 2), "OT Pay": round(otp, 2),
-                     "Allow/Bonus": round(add, 2), "Advance": round(adv, 2), "Deduction": round(ded, 2),
-                     "GOSI": round(gosi, 2), "Net": round(basic + otp + add - adv - ded - gosi, 2)})
-    return pd.DataFrame(rows)
+        tp = max((a.status == "Present").sum(), 1)
+        first = True
+        for (cid, sid), g in a.groupby(["cid", "sid"], dropna=False):
+            pres = g[g.status == "Present"]
+            wkd = pres[pd.to_datetime(pres.day).dt.weekday == we]
+            nor = pres.drop(wkd.index)
+            ot_h, wk_h = (nor.hours - std).clip(lower=0).sum(), wkd.hours.sum()
+            reg_h = nor.hours.sum() - ot_h
+            ld, off = (g.status == "Leave").sum(), (g.status == "Off").sum()
+            if r.pay_type == "Monthly":
+                hr = r.rate / wd / std
+                basic = min(r.rate / wd * (len(pres) + ld + off), r.rate * months)
+            else:
+                hr, basic = r.rate, reg_h * r.rate
+            otr = r.ot_rate if r.ot_rate > 0 else hr * otm
+            food = r.food_allow * months * len(pres) / tp
+            add = ad[~ad.kind.isin(["Advance", "Deduction"])].amount.sum() if first else 0
+            adv = ad[ad.kind == "Advance"].amount.sum() if first else 0
+            ded = ad[ad.kind == "Deduction"].amount.sum() if first else 0
+            first = False
+            gosi = basic * gp / 100 if str(r.nationality).strip().lower() == gn else 0
+            net = basic + food + (ot_h + wk_h) * otr + add - adv - ded - gosi
+            rows.append({"Code": r.code, "Name": r["name"], "Company": nm(cn, cid), "Section": nm(sn, sid),
+                         "Sponsor": r.sponsor or "-", "Labour": r.labour_type, "Pay": r.pay_type, "Mode": r.pay_mode,
+                         "Rate": r.rate, "Days": len(pres), "Leave": ld, "Absent": (g.status == "Absent").sum(),
+                         "Hours": pres.hours.sum(), "OT Hrs": ot_h, "Wknd Hrs": wk_h, "Basic": basic, "Food": food,
+                         "OT Pay": ot_h * otr, "Wknd OT": wk_h * otr, "Allowances": add, "Advance": adv,
+                         "Deduction": ded, "GOSI": gosi, "Net": net, "Bank": net if r.pay_mode == "Bank" else 0,
+                         "Cash": net if r.pay_mode != "Bank" else 0, "Invoice": pres.hours.sum() * r.bill_rate})
+    df = pd.DataFrame(rows, columns=PCOLS).round(2)
+    if sec: df = df[df.Section.isin(sec)]
+    if co: df = df[df.Company.isin(co)]
+    return df
 
 
 init()
@@ -206,16 +242,16 @@ if "user" not in st.session_state:
     st.caption("First login: admin / admin123 (change it in Users)")
     st.stop()
 role = st.session_state.role
-ALL = ["Dashboard", "Employees", "Sections & Sponsors", "Attendance", "Leave", "Adjustments",
-       "Payroll", "Reports", "Settings"]
+ALL = ["Dashboard", "Employees", "Setup", "Attendance", "Leave", "Adjustments", "Costs", "Payroll",
+       "Invoices", "Reports", "Import", "Settings"]
 MENU = {"Admin": ALL + ["Users"], "HR": ALL, "Manager": ["Dashboard", "Attendance", "Leave", "Reports"]}[role]
 st.sidebar.title(f"🏢 {S('company')}")
 st.sidebar.write(f"👤 {st.session_state.user} ({role})")
 if st.sidebar.button("Logout"):
     st.session_state.clear()
     st.rerun()
-ICON = {"Dashboard": "🏠", "Employees": "👥", "Sections & Sponsors": "🏷️", "Attendance": "🗓️",
-        "Leave": "🌴", "Adjustments": "➕", "Payroll": "💵", "Reports": "📊", "Settings": "⚙️", "Users": "🔑"}
+ICON = {"Dashboard": "🏠", "Employees": "👥", "Setup": "🏷️", "Attendance": "🗓️", "Leave": "🌴", "Adjustments": "➕",
+        "Costs": "🧾", "Payroll": "💵", "Invoices": "📑", "Reports": "📊", "Import": "📥", "Settings": "⚙️", "Users": "🔑"}
 page = st.sidebar.radio("Menu", MENU, format_func=lambda x: f"{ICON.get(x, '')}  {x}")
 st.sidebar.caption(f"Today: {today().strftime(S('date_fmt'))} ({S('timezone')})")
 
@@ -299,33 +335,33 @@ if page == "Dashboard":
 # ---------------- Employees
 elif page == "Employees":
     st.header("Employees / Labour")
-    deps, sps = q("SELECT * FROM departments"), q("SELECT * FROM sponsors")
-    with st.expander("➕ Add employee"):
+    cm, ds, sp = q("SELECT * FROM companies"), q("SELECT * FROM departments"), q("SELECT * FROM sponsors")
+    pick = lambda t, n: None if n == "-" else int(t[t.name == n].id.iloc[0])
+    with st.expander("➕ Add / update employee (same code = update)"):
         with st.form("emp"):
-            c = st.columns(3)
+            c = st.columns(4)
             code, name = c[0].text_input("Code"), c[1].text_input("Name")
-            nat = c[2].text_input("Nationality")
-            sec = c[0].selectbox("Section", deps.name.tolist() or [""])
-            lt = c[1].selectbox("Labour type", ["Company", "Outside"])
-            pt = c[2].selectbox("Pay type", ["Monthly", "Hourly"])
-            rate = c[0].number_input("Rate (monthly salary or per hour)", 0.0)
-            idn, ph = c[1].text_input("ID / Iqama / Passport"), c[2].text_input("Phone")
-            spn = c[0].selectbox("Sponsor / Kafeel / Agency", ["-"] + sps.name.tolist())
-            jd = c[1].date_input("Join date", today())
-            exp = c[2].date_input("ID / Iqama expiry", today() + timedelta(days=365))
-            if st.form_submit_button("Save"):
-                did = deps[deps.name == sec].id.iloc[0] if len(deps) else None
-                sid = sps[sps.name == spn].id.iloc[0] if spn != "-" else None
-                try:
-                    q("INSERT INTO employees(code,name,dept_id,sponsor_id,labour_type,pay_type,rate,"
-                      "nationality,id_no,phone,join_date,id_expiry) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                      (code, name, None if did is None else int(did), None if sid is None else int(sid),
-                       lt, pt, rate, nat, idn, ph, str(jd), str(exp)), fetch=False)
-                    st.success("Saved"); st.rerun()
-                except Exception as ex:
-                    st.error(ex)
-    d1, d2, sec, lt, pt, spn = filters("emp")
-    df = apply_f(emp_df(), sec, lt, pt, spn)
+            nat, idn = c[2].text_input("Nationality"), c[3].text_input("ID / Iqama / Residence no.")
+            co = c[0].selectbox("Client company", ["-"] + cm.name.tolist())
+            sec = c[1].selectbox("Section", ["-"] + ds.name.tolist())
+            spn = c[2].selectbox("Sponsor / Kofil", ["-"] + sp.name.tolist())
+            lt = c[3].selectbox("Labour type", ["Company", "Outside"])
+            pt = c[0].selectbox("Pay type", ["Monthly", "Hourly"])
+            pm = c[1].selectbox("Pay mode", ["Bank", "Cash"])
+            rate = c[2].number_input("Rate (monthly basic; per hour if Hourly)", 0.0)
+            food = c[3].number_input("Food allowance / month", 0.0)
+            otr = c[0].number_input("OT rate / hour (0 = auto)", 0.0)
+            bill = c[1].number_input("Bill rate / hour (client invoice)", 0.0)
+            ph, jd = c[2].text_input("Phone"), c[3].date_input("Join date", today())
+            exp = c[0].date_input("ID expiry", today() + timedelta(days=365))
+            if st.form_submit_button("Save") and code and name:
+                save_emp(dict(code=code, name=name, nationality=nat, id_no=idn, company_id=pick(cm, co),
+                              dept_id=pick(ds, sec), sponsor_id=pick(sp, spn), labour_type=lt, pay_type=pt,
+                              pay_mode=pm, rate=rate, food_allow=food, ot_rate=otr, bill_rate=bill, phone=ph,
+                              join_date=str(jd), id_expiry=str(exp)))
+                st.success("Saved"); st.rerun()
+    f = filters("emp")
+    df = apply_f(emp_df(), *f[2:]).drop(columns=["id", "company_id", "dept_id", "sponsor_id"])
     st.dataframe(df, use_container_width=True, hide_index=True)
     download(df, "employees")
     if len(df):
@@ -333,50 +369,64 @@ elif page == "Employees":
         if st.button("Deactivate"):
             q("UPDATE employees SET active=0 WHERE code=?", (x.split(" - ")[0],), fetch=False); st.rerun()
 
-# ---------------- Sections & sponsors
-elif page == "Sections & Sponsors":
-    c1, c2 = st.columns(2)
+# ---------------- Setup
+elif page == "Setup":
+    st.header("Setup: Client companies, Sections, Sponsors / Kofil")
+    c1, c2, c3 = st.columns(3)
     with c1:
-        st.subheader("Sections / Departments")
+        st.subheader("Client companies")
+        n, v = st.text_input("Company name"), st.text_input("VAT / Tax no")
+        if st.button("Add company") and n:
+            q("INSERT OR IGNORE INTO companies(name,vat) VALUES(?,?)", (n, v), fetch=False); st.rerun()
+        st.dataframe(q("SELECT name, vat FROM companies"), hide_index=True)
+    with c2:
+        st.subheader("Sections")
         n = st.text_input("New section")
         if st.button("Add section") and n:
             q("INSERT OR IGNORE INTO departments(name) VALUES(?)", (n,), fetch=False); st.rerun()
         st.dataframe(q("SELECT name FROM departments"), hide_index=True)
-    with c2:
-        st.subheader("Sponsors (Kafeel) / Agencies")
-        n, p = st.text_input("Sponsor name"), st.text_input("Phone")
+    with c3:
+        st.subheader("Sponsors / Kofil")
+        n, p_ = st.text_input("Sponsor / Kofil name"), st.text_input("Phone")
         if st.button("Add sponsor") and n:
-            q("INSERT OR IGNORE INTO sponsors(name,phone) VALUES(?,?)", (n, p), fetch=False); st.rerun()
+            q("INSERT OR IGNORE INTO sponsors(name,phone) VALUES(?,?)", (n, p_), fetch=False); st.rerun()
         st.dataframe(q("SELECT name, phone FROM sponsors"), hide_index=True)
 
 # ---------------- Attendance
 elif page == "Attendance":
-    st.header("Attendance")
-    day = st.date_input("Date", today())
-    secs = ["All"] + q("SELECT name FROM departments").name.tolist()
-    sec = st.selectbox("Section", secs)
-    e = emp_df()
-    if sec != "All": e = e[e.section == sec]
+    st.header("Attendance (company & section per day)")
+    cm, ds = q("SELECT * FROM companies"), q("SELECT * FROM departments")
+    cn, sn = dict(zip(cm.id, cm.name)), dict(zip(ds.id, ds.name))
+    ci, si = {v: int(k) for k, v in cn.items()}, {v: int(k) for k, v in sn.items()}
+    c = st.columns(3)
+    day = c[0].date_input("Date", today())
+    fco, fsec = c[1].multiselect("Company", list(cn.values())), c[2].multiselect("Section", list(sn.values()))
+    e = apply_f(emp_df(), fsec, (), (), (), fco)
     old = q("SELECT * FROM attendance WHERE day=?", (str(day),))
+    nm = lambda v, d: d.get(int(v), "") if pd.notna(v) else ""
     rows = []
     for _, r in e.iterrows():
         o = old[old.emp_id == r.id]
+        h = o.iloc[0] if len(o) else None
+        g = lambda col, dflt: h[col] if h is not None and pd.notna(h[col]) else dflt
         rows.append({"id": r.id, "Code": r.code, "Name": r["name"], "Labour": r.labour_type,
-                     "Status": o.status.iloc[0] if len(o) else "Present",
-                     "In": o.in_t.iloc[0] if len(o) else "08:00",
-                     "Out": o.out_t.iloc[0] if len(o) else "17:00"})
+                     "Company": nm(g("company_id", None), cn) or (r.company or ""),
+                     "Section": nm(g("dept_id", None), sn) or (r.section or ""),
+                     "Status": g("status", "Present"), "In": g("in_t", "08:00"), "Out": g("out_t", "17:00")})
     ed = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True,
                         disabled=["id", "Code", "Name", "Labour"],
-                        column_config={"id": None, "Status": st.column_config.SelectboxColumn(
-                            options=["Present", "Absent", "Leave", "Off"])})
-    st.caption("Time format HH:MM (24h). Overnight shifts supported.")
+                        column_config={"id": None,
+                                       "Company": st.column_config.SelectboxColumn(options=[""] + list(cn.values())),
+                                       "Section": st.column_config.SelectboxColumn(options=[""] + list(sn.values())),
+                                       "Status": st.column_config.SelectboxColumn(options=["Present", "Absent", "Leave", "Off"])})
+    st.caption("Time HH:MM (24h), overnight shifts supported. Hours on the weekend day (Settings) are paid as OT.")
     if st.button("💾 Save attendance"):
         for _, r in ed.iterrows():
             h = hrs(r.In, r.Out) if r.Status == "Present" else 0
-            q("INSERT INTO attendance(emp_id,day,status,in_t,out_t,hours) VALUES(?,?,?,?,?,?) "
-              "ON CONFLICT(emp_id,day) DO UPDATE SET status=excluded.status,in_t=excluded.in_t,"
-              "out_t=excluded.out_t,hours=excluded.hours",
-              (int(r.id), str(day), r.Status, r.In, r.Out, h), fetch=False)
+            q("INSERT INTO attendance(emp_id,day,status,in_t,out_t,hours,company_id,dept_id) VALUES(?,?,?,?,?,?,?,?) "
+              "ON CONFLICT(emp_id,day) DO UPDATE SET status=excluded.status,in_t=excluded.in_t,out_t=excluded.out_t,"
+              "hours=excluded.hours,company_id=excluded.company_id,dept_id=excluded.dept_id",
+              (int(r.id), str(day), r.Status, r.In, r.Out, h, ci.get(r.Company), si.get(r.Section)), fetch=False)
         st.success("Saved")
 
 # ---------------- Leave
@@ -392,12 +442,12 @@ elif page == "Leave":
                 eid = int(e[e.code == x.split(" - ")[0]].id.iloc[0])
                 q("INSERT INTO leaves(emp_id,ltype,start,end,days,status) VALUES(?,?,?,?,?,'Pending')",
                   (eid, lt, str(a), str(b), (b - a).days + 1), fetch=False); st.rerun()
-    d1, d2, sec, lt, pt, spn = filters("lv")
-    df = q("""SELECT l.id, e.code, e.name, d.name AS section, s.name AS sponsor, e.labour_type, e.pay_type,
+    d1, d2, sec, lt, pt, spn, co = filters("lv")
+    df = q("""SELECT l.id, e.code, e.name, c.name AS company, d.name AS section, s.name AS sponsor, e.labour_type, e.pay_type,
         l.ltype, l.start, l.end, l.days, l.status FROM leaves l JOIN employees e ON e.id=l.emp_id
-        LEFT JOIN departments d ON d.id=e.dept_id LEFT JOIN sponsors s ON s.id=e.sponsor_id
+        LEFT JOIN departments d ON d.id=e.dept_id LEFT JOIN sponsors s ON s.id=e.sponsor_id LEFT JOIN companies c ON c.id=e.company_id
         WHERE l.start<=? AND l.end>=?""", (d2, d1))
-    df = apply_f(df, sec, lt, pt, spn)
+    df = apply_f(df, sec, lt, pt, spn, co)
     st.dataframe(df, use_container_width=True, hide_index=True); download(df, "leave")
     pend = df[df.status == "Pending"]
     if len(pend):
@@ -422,7 +472,7 @@ elif page == "Adjustments":
     with st.form("adj"):
         c = st.columns(5)
         x = c[0].selectbox("Employee", e.code + " - " + e["name"])
-        k = c[1].selectbox("Type", ["Advance", "Deduction", "Bonus", "Allowance"])
+        k = c[1].selectbox("Type", ["Advance", "Deduction", "Bonus", "Allowance", "Supervisor/Operator", "Foundation Day", "Skill/Villa", "Extra", "Eid Bonus"])
         am = c[2].number_input("Amount", 0.0)
         dy = c[3].date_input("Date", today())
         nt = c[4].text_input("Note")
@@ -432,9 +482,9 @@ elif page == "Adjustments":
               (eid, str(dy), k, am, nt), fetch=False)
             st.rerun()
     f = filters("adj")
-    df = q("""SELECT a.id, a.day, e.code, e.name, d.name AS section, s.name AS sponsor, e.labour_type,
+    df = q("""SELECT a.id, a.day, e.code, e.name, c.name AS company, d.name AS section, s.name AS sponsor, e.labour_type,
         e.pay_type, a.kind, a.amount, a.note FROM adjustments a JOIN employees e ON e.id=a.emp_id
-        LEFT JOIN departments d ON d.id=e.dept_id LEFT JOIN sponsors s ON s.id=e.sponsor_id
+        LEFT JOIN departments d ON d.id=e.dept_id LEFT JOIN sponsors s ON s.id=e.sponsor_id LEFT JOIN companies c ON c.id=e.company_id
         WHERE a.day BETWEEN ? AND ?""", (f[0], f[1]))
     df = apply_f(df, *f[2:])
     st.dataframe(df, use_container_width=True, hide_index=True)
@@ -482,42 +532,163 @@ elif page == "Payroll":
         except ImportError:
             st.info("For payslip PDF run: pip install reportlab")
 
+# ---------------- Costs
+elif page == "Costs":
+    st.header("Costs: ID/Iqama, permits, insurance, tickets, medical...")
+    e, cm = emp_df(), q("SELECT * FROM companies")
+    with st.form("cost"):
+        c = st.columns(5)
+        x = c[0].selectbox("Employee (optional)", ["-"] + (e.code + " - " + e["name"]).tolist())
+        cat = c[1].selectbox("Category", ["ID / Iqama (Juazat)", "Work permit", "Insurance", "Transfer", "Muqeem / Monduf fee",
+                                          "Exit re-entry", "Passport", "Medical", "Vacation ticket", "GOSI", "Other"])
+        co_ = c[2].selectbox("Client company", ["-"] + cm.name.tolist())
+        am, dy = c[3].number_input("Amount", 0.0), c[4].date_input("Date", today())
+        nt = st.text_input("Note")
+        if st.form_submit_button("Add"):
+            eid = None if x == "-" else int(e[e.code == x.split(" - ")[0]].id.iloc[0])
+            cid = None if co_ == "-" else int(cm[cm.name == co_].id.iloc[0])
+            q("INSERT INTO costs(day,category,emp_id,company_id,amount,note) VALUES(?,?,?,?,?,?)",
+              (str(dy), cat, eid, cid, am, nt), fetch=False); st.rerun()
+    f = filters("cost")
+    df = q("""SELECT x.id, x.day, x.category, e.code, e.name, c.name AS company, d.name AS section, s.name AS sponsor,
+        e.labour_type, e.pay_type, x.amount, x.note FROM costs x LEFT JOIN employees e ON e.id=x.emp_id
+        LEFT JOIN companies c ON c.id=x.company_id LEFT JOIN departments d ON d.id=e.dept_id
+        LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE x.day BETWEEN ? AND ?""", (f[0], f[1]))
+    df = apply_f(df, *f[2:])
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df.groupby("category").amount.sum().reset_index(), hide_index=True)
+    download(df, "costs")
+    rid = st.number_input("Delete cost ID", 0, step=1)
+    if st.button("Delete cost") and rid:
+        q("DELETE FROM costs WHERE id=?", (int(rid),), fetch=False); st.rerun()
+
+# ---------------- Invoices
+elif page == "Invoices":
+    st.header("Client invoices & company-wise profit")
+    f = filters("inv")
+    p = calc_payroll(*f)
+    vat = float(S("vat_pct"))
+    if len(p):
+        g = p.groupby("Company").agg(Labour=("Code", "nunique"), Hours=("Hours", "sum"), Invoice=("Invoice", "sum"),
+                                     Payroll=("Net", "sum")).reset_index()
+        cost = q("""SELECT COALESCE(c.name,'-') AS Company, SUM(x.amount) AS Costs FROM costs x
+            LEFT JOIN companies c ON c.id=x.company_id WHERE x.day BETWEEN ? AND ? GROUP BY 1""", (f[0], f[1]))
+        g = g.merge(cost, how="left", on="Company").fillna({"Costs": 0})
+        g["VAT"] = g.Invoice * vat / 100
+        g["Invoice + VAT"] = g.Invoice + g.VAT
+        g["Profit"] = g.Invoice - g.Payroll - g.Costs
+        g = g.round(2)
+        st.dataframe(g, use_container_width=True, hide_index=True)
+        c = st.columns(3)
+        c[0].metric("Invoice (ex VAT)", f"{g.Invoice.sum():,.2f} {cur_}")
+        c[1].metric("Payroll + costs", f"{g.Payroll.sum() + g.Costs.sum():,.2f} {cur_}")
+        c[2].metric("Profit / Loss", f"{g.Profit.sum():,.2f} {cur_}")
+        download(g, "company_profit")
+        who = st.selectbox("Invoice detail for company", g.Company)
+        d = p[p.Company == who][["Name", "Section", "Hours", "Invoice"]].copy()
+        d["Rate/hr"] = (d.Invoice / d.Hours.where(d.Hours > 0)).round(2)
+        st.dataframe(d, use_container_width=True, hide_index=True)
+        download(d, "invoice_" + who.replace(" ", "_"))
+    else:
+        st.info("No attendance in this range.")
+
+# ---------------- Import
+elif page == "Import":
+    st.header("Bulk import employees (Excel / CSV)")
+    T = ["Code", "Name", "Nationality", "ID No", "Phone", "Company", "Section", "Sponsor", "Labour Type", "Pay Type",
+         "Pay Mode", "Rate", "Food Allow", "OT Rate", "Bill Rate", "Join Date", "ID Expiry"]
+    st.download_button("⬇ Download template", pd.DataFrame(columns=T).to_csv(index=False), "employee_template.csv")
+    st.caption("Labour Type: Company / Outside. Pay Type: Monthly / Hourly. Pay Mode: Bank / Cash. "
+               "Companies, sections and sponsors are created automatically. Same Code = update.")
+    up = st.file_uploader("Upload .xlsx or .csv", type=["xlsx", "csv"])
+    if up is not None:
+        df = pd.read_csv(up, dtype=str) if up.name.endswith(".csv") else pd.read_excel(up, dtype=str)
+        st.dataframe(df.head(20), use_container_width=True)
+        if st.button("Import now"):
+            txt = lambda v: "" if pd.isna(v) else str(v).strip()
+            num = lambda v: 0.0 if pd.isna(pd.to_numeric(v, errors="coerce")) else float(v)
+            dt = lambda v: "" if pd.isna(pd.to_datetime(v, errors="coerce")) else str(pd.to_datetime(v).date())
+
+            def idof(tbl, v):
+                v = txt(v)
+                if not v:
+                    return None
+                q(f"INSERT OR IGNORE INTO {tbl}(name) VALUES(?)", (v,), fetch=False)
+                return int(q(f"SELECT id FROM {tbl} WHERE name=?", (v,)).id[0])
+
+            n = 0
+            for _, r in df.iterrows():
+                if not txt(r.get("Code")):
+                    continue
+                save_emp(dict(code=txt(r.get("Code")), name=txt(r.get("Name")), nationality=txt(r.get("Nationality")),
+                              id_no=txt(r.get("ID No")), phone=txt(r.get("Phone")), company_id=idof("companies", r.get("Company")),
+                              dept_id=idof("departments", r.get("Section")), sponsor_id=idof("sponsors", r.get("Sponsor")),
+                              labour_type=txt(r.get("Labour Type")) or "Company", pay_type=txt(r.get("Pay Type")) or "Monthly",
+                              pay_mode=txt(r.get("Pay Mode")) or "Bank", rate=num(r.get("Rate")),
+                              food_allow=num(r.get("Food Allow")), ot_rate=num(r.get("OT Rate")),
+                              bill_rate=num(r.get("Bill Rate")), join_date=dt(r.get("Join Date")) or str(today()),
+                              id_expiry=dt(r.get("ID Expiry"))))
+                n += 1
+            st.success(f"Imported / updated {n} employees")
+
 # ---------------- Reports
 elif page == "Reports":
     st.header("Reports (custom date range)")
     kinds = ["Attendance detail", "Attendance summary"]
     if role != "Manager":
-        kinds += ["Hours (hourly basis)", "Section-wise payroll", "Labour-type payroll",
-                  "Sponsor-wise payroll", "EOSB provision"]
+        kinds += ["Payroll sheet", "Company-wise", "Section-wise", "Kofil-wise", "Company x Kofil matrix",
+                  "Hours (hourly basis)", "ID / Iqama expiry", "EOSB provision"]
     kind = st.selectbox("Report", kinds)
     f = filters("rep")
     d1, d2 = f[0], f[1]
+
+    def split(p, g):
+        out = []
+        for k, x in p.groupby(g):
+            c_, o_ = x[x.Labour == "Company"], x[x.Labour == "Outside"]
+            out.append({g: k, "Com. Persons": c_.Code.nunique(), "Com. Cash": c_.Cash.sum(), "Com. Bank": c_.Bank.sum(),
+                        "Com. Subtotal": c_.Net.sum(), "Out Persons": o_.Code.nunique(), "Out Cash": o_.Cash.sum(),
+                        "Out Bank": o_.Bank.sum(), "Out Subtotal": o_.Net.sum(), "Total": x.Net.sum()})
+        t = pd.DataFrame(out)
+        if len(t):
+            tot = t.sum(numeric_only=True)
+            tot[g] = "TOTAL"
+            t = pd.concat([t, tot.to_frame().T], ignore_index=True)
+        return t
+
     if kind == "Attendance detail":
-        df = q("""SELECT a.day, e.code, e.name, d.name AS section, s.name AS sponsor, e.labour_type,
-            e.pay_type, a.status, a.in_t, a.out_t, a.hours FROM attendance a JOIN employees e ON e.id=a.emp_id
-            LEFT JOIN departments d ON d.id=e.dept_id LEFT JOIN sponsors s ON s.id=e.sponsor_id
-            WHERE a.day BETWEEN ? AND ? ORDER BY a.day""", (d1, d2))
+        df = q("""SELECT a.day, e.code, e.name, COALESCE(c.name,c0.name) AS company, COALESCE(d.name,d0.name) AS section,
+            s.name AS sponsor, e.labour_type, e.pay_type, a.status, a.in_t, a.out_t, a.hours
+            FROM attendance a JOIN employees e ON e.id=a.emp_id
+            LEFT JOIN companies c ON c.id=a.company_id LEFT JOIN companies c0 ON c0.id=e.company_id
+            LEFT JOIN departments d ON d.id=a.dept_id LEFT JOIN departments d0 ON d0.id=e.dept_id
+            LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE a.day BETWEEN ? AND ? ORDER BY a.day""", (d1, d2))
         df = apply_f(df, *f[2:])
+    elif kind == "ID / Iqama expiry":
+        e = apply_f(emp_df(), *f[2:])
+        x = e.id_expiry.fillna("")
+        df = e[(x >= d1) & (x <= d2) & (x != "")][["code", "name", "company", "section", "sponsor", "id_no", "id_expiry"]]
+        df = df.sort_values("id_expiry")
     elif kind == "EOSB provision":
         out = []
         for _, r in apply_f(emp_df(), *f[2:]).iterrows():
-            y, w, a_ = eosb(r, datetime.strptime(d2, "%Y-%m-%d").date())
-            out.append({"Code": r.code, "Name": r["name"], "Section": r.section, "Labour": r.labour_type,
-                        "Sponsor": r.sponsor, "Join date": r.join_date, "Years": y,
-                        "Monthly wage": w, "EOSB due": a_})
+            y, w, a_ = eosb(r, date.fromisoformat(d2))
+            out.append({"Code": r.code, "Name": r["name"], "Company": r.company, "Section": r.section,
+                        "Sponsor": r.sponsor, "Join date": r.join_date, "Years": y, "Monthly wage": w, "EOSB due": a_})
         df = pd.DataFrame(out)
     else:
         p = calc_payroll(*f)
         if kind == "Attendance summary":
-            df = p[["Code", "Name", "Section", "Labour", "Sponsor", "Present", "Leave", "Absent", "Hours", "OT Hrs"]]
+            df = p[["Code", "Name", "Company", "Section", "Sponsor", "Labour", "Days", "Leave", "Absent", "Hours", "OT Hrs", "Wknd Hrs"]]
+        elif kind == "Payroll sheet":
+            df = p
         elif kind == "Hours (hourly basis)":
-            df = p[p.Pay == "Hourly"][["Code", "Name", "Section", "Labour", "Sponsor", "Rate", "Hours", "OT Hrs", "Net"]]
+            df = p[p.Pay == "Hourly"][["Code", "Name", "Company", "Section", "Sponsor", "Rate", "Hours", "OT Hrs", "Wknd Hrs", "Net"]]
+        elif kind == "Company x Kofil matrix":
+            df = p.pivot_table(index="Company", columns="Sponsor", values="Net", aggfunc="sum", fill_value=0,
+                               margins=True, margins_name="TOTAL").reset_index() if len(p) else p
         else:
-            g = {"Section-wise payroll": "Section", "Labour-type payroll": "Labour",
-                 "Sponsor-wise payroll": "Sponsor"}[kind]
-            df = p.groupby(g, dropna=False).agg(Employees=("Code", "count"), Hours=("Hours", "sum"),
-                                                 Basic=("Basic", "sum"), OT=("OT Pay", "sum"),
-                                                 Net=("Net", "sum")).reset_index()
+            df = split(p, {"Company-wise": "Company", "Section-wise": "Section", "Kofil-wise": "Sponsor"}[kind])
     st.dataframe(df, use_container_width=True, hide_index=True)
     download(df, kind.replace(" ", "_"))
 
@@ -535,8 +706,11 @@ elif page == "Settings":
         df_ = st.selectbox("Date format", ["%d-%m-%Y", "%Y-%m-%d", "%m/%d/%Y"])
         gp = st.number_input("GOSI employee deduction % (0 = off)", 0.0, 100.0, float(S("gosi_pct")))
         gn = st.text_input("GOSI applies to nationality", S("gosi_nat"))
+        vp = st.number_input("VAT % on client invoices", 0.0, 100.0, float(S("vat_pct")))
+        days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        wk = st.selectbox("Weekend OT day (hours worked this day are paid at OT rate)", days, int(S("weekend")))
         if st.form_submit_button("Save"):
             for k, v in dict(company=co, currency=cu, timezone=tz, std_hours=sh, work_days=wd,
-                             ot_mult=ot, date_fmt=df_, gosi_pct=gp, gosi_nat=gn).items():
+                             ot_mult=ot, date_fmt=df_, gosi_pct=gp, gosi_nat=gn, vat_pct=vp, weekend=days.index(wk)).items():
                 q("REPLACE INTO settings VALUES(?,?)", (k, str(v)), fetch=False)
             st.success("Saved"); st.rerun()
