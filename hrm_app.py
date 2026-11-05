@@ -206,10 +206,12 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=()):
             if r.pay_type == "Monthly":
                 hr = r.rate / wd / std
                 basic = min(r.rate / wd * (len(nor) + ld), r.rate * months)
-            else:
-                hr, basic = r.rate, reg_h * r.rate
-            otr = r.ot_rate if r.ot_rate > 0 else hr * otm
-            food = r.food_allow * months * len(pres) / tp
+                otr = r.ot_rate if r.ot_rate > 0 else hr * otm
+                food = r.food_allow * months * len(pres) / tp
+            elif r.ot_rate > 0:     # Hourly with its own OT rate: normal hrs x rate, OT/weekend hrs x OT rate
+                basic, otr, food = reg_h * r.rate, r.ot_rate, 0
+            else:                   # Hourly: no month basis, all hours worked x rate
+                basic, otr, food = (reg_h + ot_h + wk_h) * r.rate, 0, 0
             add = ad[~ad.kind.isin(["Advance", "Deduction"])].amount.sum() if first else 0
             adv = ad[ad.kind == "Advance"].amount.sum() if first else 0
             ded = ad[ad.kind == "Deduction"].amount.sum() if first else 0
@@ -441,7 +443,8 @@ elif page == "Attendance":
                                        "OT Hrs": st.column_config.NumberColumn(min_value=0.0, max_value=16.0, step=0.5)})
     st.caption("P = Present (paid), L = Leave (paid), A = Absent (not paid), O = Off (not paid). Normal and OT hours are "
                "pre-filled from Settings (default 10 + 2) - change per person if different. Monthly staff are paid per "
-               "day; OT hours are paid extra. Weekend day: no work = no pay, work = all hours paid as OT.")
+               "day; OT hours are paid extra. Weekend day: no work = no pay, work = all hours paid as OT. "
+               "Hourly staff: no month basis - total hours worked x hourly rate.")
     if st.button("💾 Save attendance"):
         for _, r in ed.iterrows():
             pr_ = r.Status == "P"
