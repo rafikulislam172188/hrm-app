@@ -36,16 +36,20 @@ st.markdown("""<style>
 .bars{display:flex;align-items:flex-end;gap:12px;height:130px;margin-top:8px}
 .bars div{flex:1;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;font-size:11px;color:#6b7c72}
 .bars span{width:70%;background:#2e7d4f;border-radius:4px 4px 0 0;display:block}
-[data-baseweb="select"]>div{background:#f4f8f5;border:1px solid #b7d3c1}
+[data-baseweb="select"]>div{background:#eaf5ee;border:1.5px solid #2e7d4f}
 .stMultiSelect span[data-baseweb="tag"]{background:#2e7d4f;color:#fff}
 </style>""", unsafe_allow_html=True)
-_COL = {"co": ("#e3f0ff", "#3b82f6"), "sec": ("#fff0dc", "#f59e0b"), "spn": ("#f1e8ff", "#8b5cf6"),
-        "lab": ("#e3f4e8", "#2e7d4f"), "pay": ("#fde7ea", "#e11d48"), "st": ("#e3f4e8", "#2e7d4f")}
-st.markdown("<style>" + "".join(
-    f'.st-key-{p}_{k} [data-baseweb="select"]>div{{background:{bg};border:2px solid {bd}}}'
-    f'.st-key-{p}_{k} span[data-baseweb="tag"]{{background:{bd};color:#fff}}'
-    for p in ("emp", "lv", "adj", "cost", "pay", "inv", "rep", "att", "xemp", "xatt", "xlv", "xadj", "xcost") for k, (bg, bd) in _COL.items()) + "</style>",
-    unsafe_allow_html=True)
+_COL = {"co": ("#dbeafe", "#2563eb"), "sec": ("#ffedd5", "#ea580c"), "spn": ("#ede9fe", "#7c3aed"),
+        "lab": ("#dcfce7", "#16a34a"), "pay": ("#fce7f3", "#db2777"), "st": ("#fef9c3", "#ca8a04")}
+# each coloured box is preceded by an invisible marker (<span class="cb cb-co">); CSS colours the box that follows it
+_css = '[data-testid="stElementContainer"]:has(.cb){display:none}.element-container:has(.cb){display:none}'
+for _k, (_bg, _bd) in _COL.items():
+    for _w in ('[data-testid="stElementContainer"]', ".element-container"):
+        _s = f"{_w}:has(.cb-{_k}) + {_w}"
+        _css += (f'{_s} [data-baseweb="select"]>div{{background:{_bg};border:2px solid {_bd};border-radius:8px}}'
+                 f'{_s} span[data-baseweb="tag"]{{background:{_bd};color:#fff}}'
+                 f'{_s} label p{{color:{_bd};font-weight:700}}')
+st.markdown("<style>" + _css + "</style>", unsafe_allow_html=True)
 
 
 def q(sql, p=(), fetch=True):
@@ -180,6 +184,9 @@ def msel(label, options, key, default_all=True):
     if key not in st.session_state:
         st.session_state[key] = st.session_state[key + "_prev"] = ["All"] if default_all else []
     st.session_state[key] = [x for x in st.session_state[key] if x == "All" or x in options]
+    kind = key.rsplit("_", 1)[-1]
+    if kind in _COL:
+        st.markdown(f'<span class="cb cb-{kind}"></span>', unsafe_allow_html=True)
     st.multiselect(label, ["All"] + options, key=key, on_change=_norm_cb, args=(key,))
     return list(st.session_state[key])
 
