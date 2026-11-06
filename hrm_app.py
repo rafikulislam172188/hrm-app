@@ -166,20 +166,27 @@ def save_emp(d):
       + ",".join(f"{k}=excluded.{k}" for k in cols if k != "code"), tuple(d.values()), fetch=False)
 
 
-def _all_cb(key, options):
-    st.session_state[key] = list(options) if st.session_state.get(key + "_all") else []
+def _norm_cb(key):
+    """'All' is an option inside the box: choosing it clears the rest; choosing a specific item removes 'All'."""
+    new, prev = st.session_state.get(key, []), st.session_state.get(key + "_prev", [])
+    if "All" in new and len(new) > 1:
+        new = ["All"] if "All" not in prev else [x for x in new if x != "All"]
+    st.session_state[key] = st.session_state[key + "_prev"] = new
 
 
-def msel(label, options, key):
-    """Multiselect with a 'Select all' tick box. Returns the selected list."""
-    st.multiselect(label, options, key=key)
-    st.checkbox("Select all", key=key + "_all", on_change=_all_cb, args=(key, options))
-    return list(st.session_state.get(key, []))
+def msel(label, options, key, default_all=True):
+    """Multiselect that has an 'All' option inside the box. Returns the selected list."""
+    options = list(options)
+    if key not in st.session_state:
+        st.session_state[key] = st.session_state[key + "_prev"] = ["All"] if default_all else []
+    st.session_state[key] = [x for x in st.session_state[key] if x == "All" or x in options]
+    st.multiselect(label, ["All"] + options, key=key, on_change=_norm_cb, args=(key,))
+    return list(st.session_state[key])
 
 
-def eff(sel, options):
-    """Everything selected = no filter (this also keeps rows whose company/section/kofil is still empty)."""
-    return [] if options and set(options) <= set(sel) else sel
+def eff(sel, options=()):
+    """'All' (or every item) selected = no filter, so rows with empty company/section/kofil are kept too."""
+    return [] if "All" in sel or (options and set(options) <= set(sel)) else sel
 
 
 def filters(key):
@@ -496,16 +503,16 @@ elif page == "Attendance":
     day = st.date_input("Date", today())
     c = st.columns(4)
     with c[0]:
-        fco = msel("Company *", cl, "att_co")
+        fco = msel("Company *", cl, "att_co", False)
     with c[1]:
-        fsec = msel("Section *", sl, "att_sec")
+        fsec = msel("Section *", sl, "att_sec", False)
     with c[2]:
-        fspn = msel("Sponsor / Kofil *", kl, "att_spn")
+        fspn = msel("Sponsor / Kofil *", kl, "att_spn", False)
     with c[3]:
         fst = msel("Status filter", list(LBL.values()) + ["Not marked"], "att_st")
     qs = st.text_input("🔎 Search code / name", key="att_q")
     if not (fco and fsec and fspn):
-        st.warning("Company, Section and Sponsor / Kofil are mandatory. Select them (or tick 'Select all') "
+        st.warning("Company, Section and Sponsor / Kofil are mandatory. Select them (or choose 'All') "
                    "to open the attendance sheet.")
     else:
         e = apply_f(emp_df(), eff(fsec, sl), (), (), eff(fspn, kl), eff(fco, cl), qs)
@@ -518,7 +525,7 @@ elif page == "Attendance":
             o = old[old.emp_id == r.id]
             h = o.iloc[0] if len(o) else None
             cur = CODE.get(h["status"], "P") if h is not None else None
-            if fst and (LBL[cur] if cur else "Not marked") not in fst:
+            if eff(fst) and (LBL[cur] if cur else "Not marked") not in fst:
                 continue
             g = lambda col, dflt: h[col] if h is not None and pd.notna(h[col]) else dflt
             stt = cur or ("O" if wkend else "P")
