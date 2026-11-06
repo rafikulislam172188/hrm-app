@@ -10,6 +10,7 @@ import streamlit as st
 DB = "hrm.db"
 CODE = {"Present": "P", "Absent": "A", "Leave": "L", "Off": "O"}
 REV = {v: k for k, v in CODE.items()}
+LBL = {"P": "🟢 P", "A": "🔴 A", "L": "🟡 L", "O": "⚪ O"}
 st.set_page_config(page_title="HRM", layout="wide")
 st.markdown("""<style>
 .stApp{background:#eef5ef;color:#1b2b22}
@@ -35,7 +36,16 @@ st.markdown("""<style>
 .bars{display:flex;align-items:flex-end;gap:12px;height:130px;margin-top:8px}
 .bars div{flex:1;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;font-size:11px;color:#6b7c72}
 .bars span{width:70%;background:#2e7d4f;border-radius:4px 4px 0 0;display:block}
+[data-baseweb="select"]>div{background:#f4f8f5;border:1px solid #b7d3c1}
+.stMultiSelect span[data-baseweb="tag"]{background:#2e7d4f;color:#fff}
 </style>""", unsafe_allow_html=True)
+_COL = {"co": ("#e3f0ff", "#3b82f6"), "sec": ("#fff0dc", "#f59e0b"), "spn": ("#f1e8ff", "#8b5cf6"),
+        "lab": ("#e3f4e8", "#2e7d4f"), "pay": ("#fde7ea", "#e11d48"), "st": ("#e3f4e8", "#2e7d4f")}
+st.markdown("<style>" + "".join(
+    f'.st-key-{p}_{k} [data-baseweb="select"]>div{{background:{bg};border:2px solid {bd}}}'
+    f'.st-key-{p}_{k} span[data-baseweb="tag"]{{background:{bd};color:#fff}}'
+    for p in ("emp", "lv", "adj", "cost", "pay", "inv", "rep", "att") for k, (bg, bd) in _COL.items()) + "</style>",
+    unsafe_allow_html=True)
 
 
 def q(sql, p=(), fetch=True):
@@ -156,17 +166,39 @@ def save_emp(d):
       + ",".join(f"{k}=excluded.{k}" for k in cols if k != "code"), tuple(d.values()), fetch=False)
 
 
+def _all_cb(key, options):
+    st.session_state[key] = list(options) if st.session_state.get(key + "_all") else []
+
+
+def msel(label, options, key):
+    """Multiselect with a 'Select all' tick box. Returns the selected list."""
+    st.multiselect(label, options, key=key)
+    st.checkbox("Select all", key=key + "_all", on_change=_all_cb, args=(key, options))
+    return list(st.session_state.get(key, []))
+
+
+def eff(sel, options):
+    """Everything selected = no filter (this also keeps rows whose company/section/kofil is still empty)."""
+    return [] if options and set(options) <= set(sel) else sel
+
+
 def filters(key):
-    """Every page: custom date range + Company / Section / Labour / Pay type / Sponsor(Kofil) filters + search."""
+    """Every page: custom date range + Company / Section / Labour / Pay type / Kofil filters (with Select all) + search."""
+    cos, secs, spns = (q(f"SELECT name FROM {t}").name.tolist() for t in ("companies", "departments", "sponsors"))
     c = st.columns(3)
     d1 = c[0].date_input("From", today().replace(day=1), key=key + "a")
     d2 = c[1].date_input("To", today(), key=key + "b")
-    co = c[2].multiselect("Company", q("SELECT name FROM companies").name.tolist(), key=key + "g")
+    with c[2]:
+        co = eff(msel("Company", cos, key + "_co"), cos)
     c = st.columns(4)
-    sec = c[0].multiselect("Section", q("SELECT name FROM departments").name.tolist(), key=key + "c")
-    lt = c[1].multiselect("Labour", ["Company", "Outside"], key=key + "d")
-    pt = c[2].multiselect("Pay type", ["Monthly", "Hourly"], key=key + "e")
-    spn = c[3].multiselect("Sponsor / Kofil", q("SELECT name FROM sponsors").name.tolist(), key=key + "f")
+    with c[0]:
+        sec = eff(msel("Section", secs, key + "_sec"), secs)
+    with c[1]:
+        lt = eff(msel("Labour", ["Company", "Outside"], key + "_lab"), ["Company", "Outside"])
+    with c[2]:
+        pt = eff(msel("Pay type", ["Monthly", "Hourly"], key + "_pay"), ["Monthly", "Hourly"])
+    with c[3]:
+        spn = eff(msel("Sponsor / Kofil", spns, key + "_spn"), spns)
     qs = st.text_input("🔎 Search code / name", key=key + "h")
     return str(d1), str(d2), sec, lt, pt, spn, co, qs
 
@@ -460,58 +492,70 @@ elif page == "Attendance":
     cm, ds, sp = q("SELECT * FROM companies"), q("SELECT * FROM departments"), q("SELECT * FROM sponsors")
     cn, sn = dict(zip(cm.id, cm.name)), dict(zip(ds.id, ds.name))
     ci, si = {v: int(k) for k, v in cn.items()}, {v: int(k) for k, v in sn.items()}
-    c = st.columns(3)
-    day = c[0].date_input("Date", today())
-    fco, fsec = c[1].multiselect("Company", list(cn.values())), c[2].multiselect("Section", list(sn.values()))
-    c = st.columns(3)
-    fspn = c[0].multiselect("Sponsor / Kofil", sp.name.tolist())
-    qs = c[2].text_input("🔎 Search code / name")
-    fst = c[1].multiselect("Status filter (as saved for this date)", ["P", "A", "L", "O", "Not marked"])
-    e = apply_f(emp_df(), fsec, (), (), fspn, fco, qs)
-    old = q("SELECT * FROM attendance WHERE day=?", (str(day),))
-    dn, do_ = float(S("def_normal")), float(S("def_ot"))
-    wkend = day.weekday() == int(S("weekend"))
-    nm = lambda v, d: d.get(int(v), "") if pd.notna(v) else ""
-    rows = []
-    for _, r in e.iterrows():
-        o = old[old.emp_id == r.id]
-        h = o.iloc[0] if len(o) else None
-        cur = CODE.get(h["status"], "P") if h is not None else None
-        if fst and (cur or "Not marked") not in fst:
-            continue
-        g = lambda col, dflt: h[col] if h is not None and pd.notna(h[col]) else dflt
-        stt = cur or ("O" if wkend else "P")
-        sv = h is not None and stt == "P"
-        rows.append({"id": r.id, "Code": r.code, "Name": r["name"], "Labour": r.labour_type, "Sponsor": r.sponsor or "",
-                     "Company": nm(g("company_id", None), cn) or (r.company or ""),
-                     "Section": nm(g("dept_id", None), sn) or (r.section or ""),
-                     "OT Rate": ot_rate_of(r.rate, r.pay_type, r.ot_rate, str(day)), "Status": stt, "Normal Hrs": float(g("hours", dn)) if sv else dn,
-                     "OT Hrs": float(g("ot_hours", 0.0)) if sv else do_})
-    if wkend:
-        st.info("This date is the weekend day: everyone starts as O (no work, no pay). Change to P only for those who "
-                "worked - all their hours are then paid as OT.")
-    ed = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True,
-                        key=f"att{day}{fco}{fsec}{fspn}{fst}{qs}", disabled=["id", "Code", "Name", "Labour", "Sponsor", "OT Rate"],
-                        column_config={"id": None,
-                                       "Company": st.column_config.SelectboxColumn(options=[""] + list(cn.values())),
-                                       "Section": st.column_config.SelectboxColumn(options=[""] + list(sn.values())),
-                                       "Status": st.column_config.SelectboxColumn(options=["P", "A", "L", "O"],
-                                                                                  help="P=Present, A=Absent, L=Leave, O=Off"),
-                                       "Normal Hrs": st.column_config.NumberColumn(min_value=0.0, max_value=24.0, step=0.5),
-                                       "OT Hrs": st.column_config.NumberColumn(min_value=0.0, max_value=16.0, step=0.5)})
-    st.caption("P = Present (paid), L = Leave (paid), A = Absent (not paid), O = Off (not paid). Normal and OT hours are "
-               "pre-filled from Settings (default 10 + 2) - change per person if different. Monthly staff are paid per "
-               "day; OT hours are paid extra. Weekend day: no work = no pay, work = all hours paid as OT. "
-               "Hourly staff: no month basis - total hours worked x hourly rate.")
-    if st.button("💾 Save attendance"):
-        for _, r in ed.iterrows():
-            pr_ = r.Status == "P"
-            q("INSERT INTO attendance(emp_id,day,status,hours,ot_hours,company_id,dept_id) VALUES(?,?,?,?,?,?,?) "
-              "ON CONFLICT(emp_id,day) DO UPDATE SET status=excluded.status,hours=excluded.hours,"
-              "ot_hours=excluded.ot_hours,company_id=excluded.company_id,dept_id=excluded.dept_id",
-              (int(r.id), str(day), REV[r.Status], float(r["Normal Hrs"]) if pr_ else 0.0,
-               float(r["OT Hrs"]) if pr_ else 0.0, ci.get(r.Company), si.get(r.Section)), fetch=False)
-        st.success("Saved")
+    cl, sl, kl = list(cn.values()), list(sn.values()), sp.name.tolist()
+    day = st.date_input("Date", today())
+    c = st.columns(4)
+    with c[0]:
+        fco = msel("Company *", cl, "att_co")
+    with c[1]:
+        fsec = msel("Section *", sl, "att_sec")
+    with c[2]:
+        fspn = msel("Sponsor / Kofil *", kl, "att_spn")
+    with c[3]:
+        fst = msel("Status filter", list(LBL.values()) + ["Not marked"], "att_st")
+    qs = st.text_input("🔎 Search code / name", key="att_q")
+    if not (fco and fsec and fspn):
+        st.warning("Company, Section and Sponsor / Kofil are mandatory. Select them (or tick 'Select all') "
+                   "to open the attendance sheet.")
+    else:
+        e = apply_f(emp_df(), eff(fsec, sl), (), (), eff(fspn, kl), eff(fco, cl), qs)
+        old = q("SELECT * FROM attendance WHERE day=?", (str(day),))
+        dn, do_ = float(S("def_normal")), float(S("def_ot"))
+        wkend = day.weekday() == int(S("weekend"))
+        nm = lambda v, d: d.get(int(v), "") if pd.notna(v) else ""
+        rows = []
+        for _, r in e.iterrows():
+            o = old[old.emp_id == r.id]
+            h = o.iloc[0] if len(o) else None
+            cur = CODE.get(h["status"], "P") if h is not None else None
+            if fst and (LBL[cur] if cur else "Not marked") not in fst:
+                continue
+            g = lambda col, dflt: h[col] if h is not None and pd.notna(h[col]) else dflt
+            stt = cur or ("O" if wkend else "P")
+            sv = h is not None and stt == "P"
+            rows.append({"id": r.id, "Code": r.code, "Name": r["name"], "Labour": r.labour_type, "Sponsor": r.sponsor or "",
+                         "Company": nm(g("company_id", None), cn) or (r.company or ""),
+                         "Section": nm(g("dept_id", None), sn) or (r.section or ""),
+                         "OT Rate": ot_rate_of(r.rate, r.pay_type, r.ot_rate, str(day)), "Status": LBL[stt],
+                         "Normal Hrs": float(g("hours", dn)) if sv else dn,
+                         "OT Hrs": float(g("ot_hours", 0.0)) if sv else do_})
+        if wkend:
+            st.info("This date is the weekend day: everyone starts as O (no work, no pay). Change to P only for those "
+                    "who worked - all their hours are then paid as OT.")
+        ed = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True,
+                            key=f"att{day}{fco}{fsec}{fspn}{fst}{qs}",
+                            disabled=["id", "Code", "Name", "Labour", "Sponsor", "OT Rate"],
+                            column_config={"id": None,
+                                           "Company": st.column_config.SelectboxColumn(options=[""] + cl),
+                                           "Section": st.column_config.SelectboxColumn(options=[""] + sl),
+                                           "Status": st.column_config.SelectboxColumn(options=list(LBL.values()),
+                                                                                      help="P=Present, A=Absent, L=Leave, O=Off"),
+                                           "Normal Hrs": st.column_config.NumberColumn(min_value=0.0, max_value=24.0, step=0.5),
+                                           "OT Hrs": st.column_config.NumberColumn(min_value=0.0, max_value=16.0, step=0.5)})
+        st.caption("🟢 P = Present (paid), 🟡 L = Leave (paid), 🔴 A = Absent (not paid), ⚪ O = Off (not paid). Normal and "
+                   "OT hours are pre-filled from Settings - change per person if different. Monthly staff are paid per "
+                   "day; OT hours are paid extra. Weekend day: no work = no pay, work = all hours paid as OT. "
+                   "Hourly staff: no month basis - total hours worked x hourly rate.")
+        if st.button("💾 Save attendance"):
+            for _, r in ed.iterrows():
+                code = r.Status[-1]
+                pr_ = code == "P"
+                q("INSERT INTO attendance(emp_id,day,status,hours,ot_hours,company_id,dept_id) VALUES(?,?,?,?,?,?,?) "
+                  "ON CONFLICT(emp_id,day) DO UPDATE SET status=excluded.status,hours=excluded.hours,"
+                  "ot_hours=excluded.ot_hours,company_id=excluded.company_id,dept_id=excluded.dept_id",
+                  (int(r.id), str(day), REV[code], float(r["Normal Hrs"]) if pr_ else 0.0,
+                   float(r["OT Hrs"]) if pr_ else 0.0, ci.get(r.Company), si.get(r.Section)), fetch=False)
+            st.success("Saved")
 
 # ---------------- Leave
 elif page == "Leave":
