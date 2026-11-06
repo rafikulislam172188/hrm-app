@@ -920,8 +920,10 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
     view = df.copy()
     for c in fks:
         view[c] = view[c].fillna("")
+    all_del = False
     if can_d:
-        view.insert(1, "Delete", False)
+        all_del = st.checkbox("☑ Select all rows for Delete (only the rows shown below)", key=f"{key}da{st.session_state.get(key + 'v', 0)}")
+        view.insert(1, "Delete", all_del)
     cfg = {"id": None, **{h: None for h in hide}}
     for c, t in lk.items():
         cfg[c] = st.column_config.SelectboxColumn(options=[""] + t.name.tolist())
@@ -932,7 +934,7 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
         editable.append("Delete")
     ver = st.session_state.get(key + "v", 0)
     ed = st.data_editor(view, hide_index=True, use_container_width=True, column_config=cfg,
-                        disabled=[c for c in view.columns if c not in editable], key=f"{key}{ver}{sq_}{fsig}")
+                        disabled=[c for c in view.columns if c not in editable], key=f"{key}{ver}{sq_}{fsig}{all_del}")
 
     def done(msg):
         st.session_state[key + "v"] = ver + 1
