@@ -44,7 +44,7 @@ _COL = {"co": ("#e3f0ff", "#3b82f6"), "sec": ("#fff0dc", "#f59e0b"), "spn": ("#f
 st.markdown("<style>" + "".join(
     f'.st-key-{p}_{k} [data-baseweb="select"]>div{{background:{bg};border:2px solid {bd}}}'
     f'.st-key-{p}_{k} span[data-baseweb="tag"]{{background:{bd};color:#fff}}'
-    for p in ("emp", "lv", "adj", "cost", "pay", "inv", "rep", "att") for k, (bg, bd) in _COL.items()) + "</style>",
+    for p in ("emp", "lv", "adj", "cost", "pay", "inv", "rep", "att", "xemp", "xatt", "xlv", "xadj", "xcost") for k, (bg, bd) in _COL.items()) + "</style>",
     unsafe_allow_html=True)
 
 
@@ -885,7 +885,7 @@ CAN_DELETE = ("Admin",)         # roles that can delete (change here if you want
 
 
 def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used_in=(), cascade=(), key="m",
-           after_upd=None, before_del=None, guard=None):
+           after_upd=None, before_del=None, guard=None, flt=None):
     """Inline Edit + Delete grid for any table. `sql` must return `id` plus the columns to show."""
     can_e, can_d = role in CAN_EDIT, role in CAN_DELETE
     if not (can_e or can_d):
@@ -894,6 +894,22 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
         st.success(st.session_state.pop("flash"))
     fks, selects = fks or {}, selects or {}
     df = q(sql, params)
+    fsig = ""
+    if flt:   # Company / Section / Kofil / Labour / Pay type boxes with 'All' inside, same as the report pages
+        cos, secs, spns = (q(f"SELECT name FROM {t}").name.tolist() for t in ("companies", "departments", "sponsors"))
+        c = st.columns(5)
+        with c[0]:
+            co = eff(msel("Company", cos, flt + "_co"), cos)
+        with c[1]:
+            sec = eff(msel("Section", secs, flt + "_sec"), secs)
+        with c[2]:
+            spn = eff(msel("Sponsor / Kofil", spns, flt + "_spn"), spns)
+        with c[3]:
+            lt = eff(msel("Labour", ["Company", "Outside"], flt + "_lab"), ["Company", "Outside"])
+        with c[4]:
+            pt = eff(msel("Pay type", ["Monthly", "Hourly"], flt + "_pay"), ["Monthly", "Hourly"])
+        df = apply_f(df, sec, lt, pt, spn, co).reset_index(drop=True)
+        fsig = str((co, sec, spn, lt, pt))
     sq_ = st.text_input("🔎 Search", key=key + "q")
     if sq_ and not df.empty:
         df = df[df.astype(str).apply(lambda col: col.str.contains(sq_, case=False, regex=False)).any(axis=1)].reset_index(drop=True)
@@ -916,7 +932,7 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
         editable.append("Delete")
     ver = st.session_state.get(key + "v", 0)
     ed = st.data_editor(view, hide_index=True, use_container_width=True, column_config=cfg,
-                        disabled=[c for c in view.columns if c not in editable], key=f"{key}{ver}{sq_}")
+                        disabled=[c for c in view.columns if c not in editable], key=f"{key}{ver}{sq_}{fsig}")
 
     def done(msg):
         st.session_state[key + "v"] = ver + 1
@@ -1007,14 +1023,16 @@ def lv_sync(o, r):  # after editing a leave: recalc days and rebuild its attenda
 if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Setup", "Attendance", "Leave", "Adjustments", "Costs", "Users"):
     st.divider()
     st.subheader("✏️ Edit / 🗑 Delete")
-    st.caption("Change cells then press Save. To delete: tick 'Delete', confirm, press Delete. Dates are YYYY-MM-DD.")
+    st.caption("Choose Company / Section / Kofil (or All), change cells, then press Save. To delete: tick 'Delete', "
+               "confirm, press Delete. Dates are YYYY-MM-DD.")
+    EJ = (" LEFT JOIN companies c ON c.id=e.company_id LEFT JOIN departments d ON d.id=e.dept_id"
+          " LEFT JOIN sponsors s ON s.id=e.sponsor_id ")
+    EC = "c.name AS company, d.name AS section, s.name AS sponsor, e.labour_type, e.pay_type"
 
     if page == "Employees":
         manage("employees", """SELECT e.id, e.code, e.name, c.name AS company, d.name AS section, s.name AS sponsor,
             e.labour_type, e.pay_type, e.pay_mode, e.rate, e.food_allow, e.ot_rate, e.bill_rate, e.nationality,
-            e.id_no, e.phone, e.join_date, e.id_expiry, e.active FROM employees e
-            LEFT JOIN companies c ON c.id=e.company_id LEFT JOIN departments d ON d.id=e.dept_id
-            LEFT JOIN sponsors s ON s.id=e.sponsor_id ORDER BY e.code""",
+            e.id_no, e.phone, e.join_date, e.id_expiry, e.active FROM employees e""" + EJ + "ORDER BY e.code",
                edit=["code", "name", "labour_type", "pay_type", "pay_mode", "rate", "food_allow", "ot_rate", "bill_rate",
                      "nationality", "id_no", "phone", "join_date", "id_expiry", "active"],
                fks={"company": ("company_id", "companies"), "section": ("dept_id", "departments"),
@@ -1022,7 +1040,7 @@ if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Setup", "Attendance"
                selects={"labour_type": ["Company", "Outside"], "pay_type": ["Monthly", "Hourly"],
                         "pay_mode": ["Bank", "Cash"], "active": [1, 0]},
                cascade=[("attendance", "emp_id"), ("leaves", "emp_id"), ("adjustments", "emp_id"), ("costs", "emp_id")],
-               key="emp")
+               key="emp", flt="xemp")
 
     elif page == "Setup":
         t1, t2, t3 = st.tabs(["Companies", "Sections", "Sponsors / Kofil"])
@@ -1038,34 +1056,42 @@ if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Setup", "Attendance"
 
     elif page == "Attendance":
         a1, a2 = dr("mat")
-        manage("attendance", """SELECT a.id, a.day, e.code, e.name AS employee, a.status, a.hours, a.ot_hours
-            FROM attendance a JOIN employees e ON e.id=a.emp_id WHERE a.day BETWEEN ? AND ?
-            ORDER BY a.day DESC, e.code""", (a1, a2),
-               edit=["status", "hours", "ot_hours"], selects={"status": ["Present", "Absent", "Leave", "Off"]}, key="att")
+        manage("attendance", """SELECT a.id, a.day, e.code, e.name AS employee, c.name AS company, d.name AS section,
+            s.name AS sponsor, e.labour_type, e.pay_type, a.status, a.hours, a.ot_hours FROM attendance a
+            JOIN employees e ON e.id=a.emp_id LEFT JOIN companies c ON c.id=COALESCE(a.company_id,e.company_id)
+            LEFT JOIN departments d ON d.id=COALESCE(a.dept_id,e.dept_id) LEFT JOIN sponsors s ON s.id=e.sponsor_id
+            WHERE a.day BETWEEN ? AND ? ORDER BY a.day DESC, e.code""", (a1, a2),
+               edit=["status", "hours", "ot_hours"], selects={"status": ["Present", "Absent", "Leave", "Off"]},
+               key="att", flt="xatt")
 
     elif page == "Leave":
-        manage("leaves", """SELECT l.id, l.emp_id, e.code, e.name AS employee, l.ltype, l.start, l.end, l.days, l.status
-            FROM leaves l JOIN employees e ON e.id=l.emp_id ORDER BY l.start DESC""",
+        a1, a2 = dr("mlv")
+        manage("leaves", "SELECT l.id, l.emp_id, e.code, e.name AS employee, " + EC + ", l.ltype, l.start, l.end, l.days, "
+               "l.status FROM leaves l JOIN employees e ON e.id=l.emp_id" + EJ +
+               "WHERE l.start<=? AND l.end>=? ORDER BY l.start DESC", (a2, a1),
                edit=["ltype", "start", "end"], hide=("emp_id",),
                selects={"ltype": ["Annual", "Sick", "Emergency", "Unpaid", "Other"]},
-               after_upd=lv_sync, before_del=lv_clear, key="lv")
+               after_upd=lv_sync, before_del=lv_clear, key="lv", flt="xlv")
 
     elif page == "Adjustments":
         a1, a2 = dr("mad")
-        manage("adjustments", """SELECT a.id, a.day, e.code, e.name AS employee, a.kind, a.amount, a.note
-            FROM adjustments a JOIN employees e ON e.id=a.emp_id WHERE a.day BETWEEN ? AND ? ORDER BY a.day DESC""",
-               (a1, a2), edit=["day", "kind", "amount", "note"],
+        manage("adjustments", "SELECT a.id, a.day, e.code, e.name AS employee, " + EC + ", a.kind, a.amount, a.note "
+               "FROM adjustments a JOIN employees e ON e.id=a.emp_id" + EJ +
+               "WHERE a.day BETWEEN ? AND ? ORDER BY a.day DESC", (a1, a2),
+               edit=["day", "kind", "amount", "note"],
                selects={"kind": ["Advance", "Deduction", "Bonus", "Allowance", "Supervisor/Operator", "Foundation Day",
-                                 "Skill/Villa", "Extra", "Eid Bonus"]}, key="adj")
+                                 "Skill/Villa", "Extra", "Eid Bonus"]}, key="adj", flt="xadj")
 
     elif page == "Costs":
         a1, a2 = dr("mco")
-        manage("costs", """SELECT x.id, x.day, x.category, e.code, c.name AS company, x.amount, x.note FROM costs x
-            LEFT JOIN employees e ON e.id=x.emp_id LEFT JOIN companies c ON c.id=x.company_id
-            WHERE x.day BETWEEN ? AND ? ORDER BY x.day DESC""", (a1, a2),
+        manage("costs", """SELECT x.id, x.day, x.category, e.code, c.name AS company, d.name AS section, s.name AS sponsor,
+            e.labour_type, e.pay_type, x.amount, x.note FROM costs x LEFT JOIN employees e ON e.id=x.emp_id
+            LEFT JOIN companies c ON c.id=x.company_id LEFT JOIN departments d ON d.id=e.dept_id
+            LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE x.day BETWEEN ? AND ? ORDER BY x.day DESC""", (a1, a2),
                edit=["day", "category", "amount", "note"], fks={"company": ("company_id", "companies")},
                selects={"category": ["ID / Iqama (Juazat)", "Work permit", "Insurance", "Transfer", "Muqeem / Monduf fee",
-                                     "Exit re-entry", "Passport", "Medical", "Vacation ticket", "GOSI", "Other"]}, key="cst")
+                                     "Exit re-entry", "Passport", "Medical", "Vacation ticket", "GOSI", "Other"]},
+               key="cst", flt="xcost")
 
     elif page == "Users":
         manage("users", "SELECT id, username, role FROM users ORDER BY username", edit=["username", "role"],
