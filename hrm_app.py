@@ -401,9 +401,12 @@ if "user" not in st.session_state:
                 else:
                     st.error("Wrong username or password")
         if q("SELECT COUNT(*) AS n FROM users WHERE username='admin' AND pw=?", (pw("admin123"),)).n[0]:
-            st.caption("Please Enter Your User name & Password Users after signing in.")
-        else:
-            st.caption("Forgot your password? Ask your administrator to reset it.")
+    st.markdown(
+        "<p style='color:#ff0000; font-size:13px; font-weight:600;'>Please Enter Your User name & Password Users after signing in.</p>",
+        unsafe_allow_html=True
+    )
+else:
+    st.caption("Forgot your password? Ask your administrator to reset it.")
     st.stop()
 role = st.session_state.role
 ALL = ["Dashboard", "Employees", "Setup", "Attendance", "Leave", "Adjustments", "Costs", "Payroll",
