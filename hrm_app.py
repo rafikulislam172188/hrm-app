@@ -39,7 +39,7 @@ st.markdown("""<style>
 [data-baseweb="select"]>div{background:#eaf5ee;border:1.5px solid #2e7d4f}
 [data-baseweb="tag"]{background-color:#2e7d4f !important;color:#fff !important}
 </style>""", unsafe_allow_html=True)
-_COL = {"co": "#1f3a5f", "sec": "#e67e22", "spn": "#7d3c98", "lab": "#117a8b", "pay": "#2ea05a", "st": "#b7950b"}
+_COL = {"co": "#1f3a5f", "sec": "#e67e22", "spn": "#7d3c98", "lab": "#117a8b", "pay": "#2ea05a", "st": "#b7950b", "dt": "#64748b"}
 # each coloured frame is preceded by an invisible marker (<span class="cb cb-co">); CSS colours the frame that follows it
 _css = '[data-testid="stElementContainer"]:has(.cb){display:none}.element-container:has(.cb){display:none}'
 for _k, _c in _COL.items():
@@ -198,22 +198,28 @@ def eff(sel, options=()):
     return [] if "All" in sel or (options and set(options) <= set(sel)) else sel
 
 
+def dbox(col, label, value, key):
+    """Date input inside a coloured frame (same look as the select frames)."""
+    with col:
+        st.markdown('<span class="cb cb-dt"></span>', unsafe_allow_html=True)
+        return st.date_input(label, value, key=key)
+
+
 def filters(key):
-    """Every page: custom date range + Company / Section / Labour / Pay type / Kofil filters (with Select all) + search."""
+    """Every page, ONE row: From, To, Company, Section, Labour, Pay type, Sponsor/Kofil (+ search below)."""
     cos, secs, spns = (q(f"SELECT name FROM {t}").name.tolist() for t in ("companies", "departments", "sponsors"))
-    c = st.columns(3)
-    d1 = c[0].date_input("From", today().replace(day=1), key=key + "a")
-    d2 = c[1].date_input("To", today(), key=key + "b")
+    c = st.columns([1, 1, 1.15, 1.15, 1, 1, 1.15])
+    d1 = dbox(c[0], "From", today().replace(day=1), key + "a")
+    d2 = dbox(c[1], "To", today(), key + "b")
     with c[2]:
         co = eff(msel("Company", cos, key + "_co"), cos)
-    c = st.columns(4)
-    with c[0]:
-        sec = eff(msel("Section", secs, key + "_sec"), secs)
-    with c[1]:
-        lt = eff(msel("Labour", ["Company", "Outside"], key + "_lab"), ["Company", "Outside"])
-    with c[2]:
-        pt = eff(msel("Pay type", ["Monthly", "Hourly"], key + "_pay"), ["Monthly", "Hourly"])
     with c[3]:
+        sec = eff(msel("Section", secs, key + "_sec"), secs)
+    with c[4]:
+        lt = eff(msel("Labour", ["Company", "Outside"], key + "_lab"), ["Company", "Outside"])
+    with c[5]:
+        pt = eff(msel("Pay type", ["Monthly", "Hourly"], key + "_pay"), ["Monthly", "Hourly"])
+    with c[6]:
         spn = eff(msel("Sponsor / Kofil", spns, key + "_spn"), spns)
     qs = st.text_input("🔎 Search code / name", key=key + "h")
     return str(d1), str(d2), sec, lt, pt, spn, co, qs
@@ -556,15 +562,15 @@ elif page == "Attendance":
     cn, sn = dict(zip(cm.id, cm.name)), dict(zip(ds.id, ds.name))
     ci, si = {v: int(k) for k, v in cn.items()}, {v: int(k) for k, v in sn.items()}
     cl, sl, kl = list(cn.values()), list(sn.values()), sp.name.tolist()
-    day = st.date_input("Date", today())
-    c = st.columns(4)
-    with c[0]:
-        fco = msel("Company *", cl, "att_co", False, "Select (required)")
+    c = st.columns([1, 1.2, 1.2, 1.2, 1.2])
+    day = dbox(c[0], "Date", today(), "att_d")
     with c[1]:
-        fsec = msel("Section *", sl, "att_sec", False, "Select (required)")
+        fco = msel("Company *", cl, "att_co", False, "Select (required)")
     with c[2]:
-        fspn = msel("Sponsor / Kofil *", kl, "att_spn", False, "Select (required)")
+        fsec = msel("Section *", sl, "att_sec", False, "Select (required)")
     with c[3]:
+        fspn = msel("Sponsor / Kofil *", kl, "att_spn", False, "Select (required)")
+    with c[4]:
         fst = msel("Status filter", list(LBL.values()) + ["Not marked"], "att_st")
     qs = st.text_input("🔎 Search code / name", key="att_q")
     if not (fco and fsec and fspn):
@@ -941,7 +947,7 @@ CAN_DELETE = ("Admin",)         # roles that can delete (change here if you want
 
 
 def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used_in=(), cascade=(), key="m",
-           after_upd=None, before_del=None, guard=None, flt=None):
+           after_upd=None, before_del=None, guard=None, flt=None, cols=None):
     """Inline Edit + Delete grid for any table. `sql` must return `id` plus the columns to show."""
     can_e, can_d = role in CAN_EDIT, role in CAN_DELETE
     if not (can_e or can_d):
@@ -953,7 +959,7 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
     fsig = ""
     if flt:   # Company / Section / Kofil / Labour / Pay type boxes with 'All' inside, same as the report pages
         cos, secs, spns = (q(f"SELECT name FROM {t}").name.tolist() for t in ("companies", "departments", "sponsors"))
-        c = st.columns(5)
+        c = cols or st.columns(5)
         with c[0]:
             co = eff(msel("Company", cos, flt + "_co"), cos)
         with c[1]:
@@ -1053,10 +1059,9 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
                         st.error(" | ".join(errs))
 
 
-def dr(key):
-    c = st.columns(2)
-    return (str(c[0].date_input("From", today().replace(day=1), key=key + "1")),
-            str(c[1].date_input("To", today(), key=key + "2")))
+def dr(key, cols=None):
+    c = cols or st.columns(2)
+    return str(dbox(c[0], "From", today().replace(day=1), key + "1")), str(dbox(c[1], "To", today(), key + "2"))
 
 
 def lv_clear(r):  # remove the attendance rows an approved leave created
@@ -1113,35 +1118,39 @@ if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Setup", "Attendance"
                    used_in=[("employees", "sponsor_id")], key="msp")
 
     elif page == "Attendance":
-        a1, a2 = dr("mat")
+        cc = st.columns(7)
+        a1, a2 = dr("mat", cc[:2])
         manage("attendance", """SELECT a.id, a.day, e.code, e.name AS employee, c.name AS company, d.name AS section,
             s.name AS sponsor, e.labour_type, e.pay_type, a.status, a.hours, a.ot_hours FROM attendance a
             JOIN employees e ON e.id=a.emp_id LEFT JOIN companies c ON c.id=COALESCE(a.company_id,e.company_id)
             LEFT JOIN departments d ON d.id=COALESCE(a.dept_id,e.dept_id) LEFT JOIN sponsors s ON s.id=e.sponsor_id
             WHERE a.day BETWEEN ? AND ? ORDER BY a.day DESC, e.code""", (a1, a2),
                edit=["status", "hours", "ot_hours"], selects={"status": ["Present", "Absent", "Leave", "Off"]},
-               key="att", flt="xatt")
+               key="att", flt="xatt", cols=cc[2:])
 
     elif page == "Leave":
-        a1, a2 = dr("mlv")
+        cc = st.columns(7)
+        a1, a2 = dr("mlv", cc[:2])
         manage("leaves", "SELECT l.id, l.emp_id, e.code, e.name AS employee, " + EC + ", l.ltype, l.start, l.end, l.days, "
                "l.status FROM leaves l JOIN employees e ON e.id=l.emp_id" + EJ +
                "WHERE l.start<=? AND l.end>=? ORDER BY l.start DESC", (a2, a1),
                edit=["ltype", "start", "end"], hide=("emp_id",),
                selects={"ltype": ["Annual", "Sick", "Emergency", "Unpaid", "Other"]},
-               after_upd=lv_sync, before_del=lv_clear, key="lv", flt="xlv")
+               after_upd=lv_sync, before_del=lv_clear, key="lv", flt="xlv", cols=cc[2:])
 
     elif page == "Adjustments":
-        a1, a2 = dr("mad")
+        cc = st.columns(7)
+        a1, a2 = dr("mad", cc[:2])
         manage("adjustments", "SELECT a.id, a.day, e.code, e.name AS employee, " + EC + ", a.kind, a.amount, a.note "
                "FROM adjustments a JOIN employees e ON e.id=a.emp_id" + EJ +
                "WHERE a.day BETWEEN ? AND ? ORDER BY a.day DESC", (a1, a2),
                edit=["day", "kind", "amount", "note"],
                selects={"kind": ["Advance", "Deduction", "Bonus", "Allowance", "Supervisor/Operator", "Foundation Day",
-                                 "Skill/Villa", "Extra", "Eid Bonus"]}, key="adj", flt="xadj")
+                                 "Skill/Villa", "Extra", "Eid Bonus"]}, key="adj", flt="xadj", cols=cc[2:])
 
     elif page == "Costs":
-        a1, a2 = dr("mco")
+        cc = st.columns(7)
+        a1, a2 = dr("mco", cc[:2])
         manage("costs", """SELECT x.id, x.day, x.category, e.code, c.name AS company, d.name AS section, s.name AS sponsor,
             e.labour_type, e.pay_type, x.amount, x.note FROM costs x LEFT JOIN employees e ON e.id=x.emp_id
             LEFT JOIN companies c ON c.id=x.company_id LEFT JOIN departments d ON d.id=e.dept_id
@@ -1149,7 +1158,7 @@ if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Setup", "Attendance"
                edit=["day", "category", "amount", "note"], fks={"company": ("company_id", "companies")},
                selects={"category": ["ID / Iqama (Juazat)", "Work permit", "Insurance", "Transfer", "Muqeem / Monduf fee",
                                      "Exit re-entry", "Passport", "Medical", "Vacation ticket", "GOSI", "Other"]},
-               key="cst", flt="xcost")
+               key="cst", flt="xcost", cols=cc[2:])
 
     elif page == "Users":
         manage("users", "SELECT id, username, role FROM users ORDER BY username", edit=["username", "role"],
