@@ -37,7 +37,7 @@ st.markdown("""<style>
 .bars div{flex:1;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;font-size:11px;color:#6b7c72}
 .bars span{width:70%;background:#2e7d4f;border-radius:4px 4px 0 0;display:block}
 [data-baseweb="select"]>div{background:#eaf5ee;border:1.5px solid #2e7d4f}
-.stMultiSelect span[data-baseweb="tag"]{background:#2e7d4f;color:#fff}
+[data-baseweb="tag"]{background-color:#2e7d4f !important;color:#fff !important}
 </style>""", unsafe_allow_html=True)
 _COL = {"co": ("#dbeafe", "#2563eb"), "sec": ("#ffedd5", "#ea580c"), "spn": ("#ede9fe", "#7c3aed"),
         "lab": ("#dcfce7", "#16a34a"), "pay": ("#fce7f3", "#db2777"), "st": ("#fef9c3", "#ca8a04")}
@@ -46,8 +46,9 @@ _css = '[data-testid="stElementContainer"]:has(.cb){display:none}.element-contai
 for _k, (_bg, _bd) in _COL.items():
     for _w in ('[data-testid="stElementContainer"]', ".element-container"):
         _s = f"{_w}:has(.cb-{_k}) + {_w}"
-        _css += (f'{_s} [data-baseweb="select"]>div{{background:{_bg};border:2px solid {_bd};border-radius:8px}}'
-                 f'{_s} span[data-baseweb="tag"]{{background:{_bd};color:#fff}}'
+        _css += (f'{_s}{{background:{_bg};border:2px solid {_bd};border-radius:12px;padding:6px 10px 10px}}'
+                 f'{_s} [data-baseweb="select"]>div{{background:#fff !important;border:1px solid {_bd} !important}}'
+                 f'{_s} [data-baseweb="tag"]{{background-color:{_bd} !important;color:#fff !important}}'
                  f'{_s} label p{{color:{_bd};font-weight:700}}')
 st.markdown("<style>" + _css + "</style>", unsafe_allow_html=True)
 
@@ -178,7 +179,7 @@ def _norm_cb(key):
     st.session_state[key] = st.session_state[key + "_prev"] = new
 
 
-def msel(label, options, key, default_all=True):
+def msel(label, options, key, default_all=False, ph="All"):
     """Multiselect that has an 'All' option inside the box. Returns the selected list."""
     options = list(options)
     if key not in st.session_state:
@@ -187,7 +188,10 @@ def msel(label, options, key, default_all=True):
     kind = key.rsplit("_", 1)[-1]
     if kind in _COL:
         st.markdown(f'<span class="cb cb-{kind}"></span>', unsafe_allow_html=True)
-    st.multiselect(label, ["All"] + options, key=key, on_change=_norm_cb, args=(key,))
+    try:
+        st.multiselect(label, ["All"] + options, key=key, on_change=_norm_cb, args=(key,), placeholder=ph)
+    except TypeError:   # very old Streamlit without 'placeholder'
+        st.multiselect(label, ["All"] + options, key=key, on_change=_norm_cb, args=(key,))
     return list(st.session_state[key])
 
 
@@ -557,11 +561,11 @@ elif page == "Attendance":
     day = st.date_input("Date", today())
     c = st.columns(4)
     with c[0]:
-        fco = msel("Company *", cl, "att_co", False)
+        fco = msel("Company *", cl, "att_co", False, "Select (required)")
     with c[1]:
-        fsec = msel("Section *", sl, "att_sec", False)
+        fsec = msel("Section *", sl, "att_sec", False, "Select (required)")
     with c[2]:
-        fspn = msel("Sponsor / Kofil *", kl, "att_spn", False)
+        fspn = msel("Sponsor / Kofil *", kl, "att_spn", False, "Select (required)")
     with c[3]:
         fst = msel("Status filter", list(LBL.values()) + ["Not marked"], "att_st")
     qs = st.text_input("🔎 Search code / name", key="att_q")
