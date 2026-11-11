@@ -360,8 +360,7 @@ LOGIN_CSS = """<style>
 .lg-mid li i{font-style:normal;width:26px;height:26px;border-radius:8px;background:rgba(255,255,255,.14);display:inline-flex;align-items:center;justify-content:center;font-size:13px}
 .lg-foot{font-size:12px;opacity:.75}
 [data-testid="stColumn"]:nth-child(2)>[data-testid="stVerticalBlock"],[data-testid="column"]:nth-child(2)>div>[data-testid="stVerticalBlock"]{min-height:100vh;justify-content:center;padding:0 12%}
-[data-testid="stForm"]{background:#fff;border:none !important;border-radius:22px;padding:34px 32px 26px;width:85%;max-width:360px;margin:auto;box-sizing:border-box;box-shadow:0 20px 50px rgba(30,60,120,.12);
-}
+[data-testid="stForm"]{background:#fff;border:none !important;border-radius:22px;padding:34px 32px 26px;width:95%;max-width:380px;margin:auto;box-sizing:border-box;box-shadow:0 20px 50px rgba(30,60,120,.12);}
 .lg-head{text-align:center;margin-bottom:10px}
 .lg-head h2{margin:12px 0 2px;padding:0;font-size:26px;font-weight:800;color:#0f2447 !important}
 .lg-head p{margin:0;color:#64748b !important;font-size:14px}
