@@ -359,6 +359,7 @@ LOGIN_CSS = """<style>
 .lg-mid li{display:flex;align-items:center;gap:12px;margin:0 0 14px;font-size:15px}
 .lg-mid li i{font-style:normal;width:26px;height:26px;border-radius:8px;background:rgba(255,255,255,.14);display:inline-flex;align-items:center;justify-content:center;font-size:13px}
 .lg-foot{font-size:12px;opacity:.75}
+.lg-head p{color:#14808f !important;font-size:14px !important;font-weight:600 !important;}
 [data-testid="stColumn"]:nth-child(2)>[data-testid="stVerticalBlock"],[data-testid="column"]:nth-child(2)>div>[data-testid="stVerticalBlock"]{min-height:100vh;justify-content:center;padding:0 12%}
 [data-testid="stForm"]{background:#fff;border:none !important;border-radius:22px;padding:34px 32px 26px;width:105%;max-width:380px;margin:auto;box-sizing:border-box;box-shadow:0 20px 50px rgba(30,60,120,.12);}
 .lg-head{text-align:center;margin-bottom:10px}
