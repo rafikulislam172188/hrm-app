@@ -359,7 +359,6 @@ LOGIN_CSS = """<style>
 .lg-mid li{display:flex;align-items:center;gap:12px;margin:0 0 14px;font-size:15px}
 .lg-mid li i{font-style:normal;width:26px;height:26px;border-radius:8px;background:rgba(255,255,255,.14);display:inline-flex;align-items:center;justify-content:center;font-size:13px}
 .lg-foot{font-size:12px;opacity:.75}
-.lg-head p{color:#dc2626 !important;font-size:14px !important;font-weight:600 !important;}
 [data-testid="stColumn"]:nth-child(2)>[data-testid="stVerticalBlock"],[data-testid="column"]:nth-child(2)>div>[data-testid="stVerticalBlock"]{min-height:100vh;justify-content:center;padding:0 12%}
 [data-testid="stForm"]{background:#fff;border:none !important;border-radius:22px;padding:34px 32px 26px;width:105%;max-width:380px;margin:auto;box-sizing:border-box;box-shadow:0 20px 50px rgba(30,60,120,.12);}
 .lg-head{text-align:center;margin-bottom:10px}
@@ -370,6 +369,7 @@ LOGIN_CSS = """<style>
 [data-testid="stTextInputRootElement"]{border-radius:12px;background:#f8fafc;border:1px solid #dbe3ee}
 [data-testid="stFormSubmitButton"] button{width:100%;height:48px;border:none;border-radius:12px;font-weight:700;background:linear-gradient(90deg,#14808f,#2c6db3);box-shadow:0 8px 18px rgba(30,110,170,.30)}
 [data-testid="stFormSubmitButton"] button p{color:#fff !important}
+.lg-head p{color:#ff0000 !important;font-size:14px !important;font-weight:600 !important;}
 </style>"""
 
 if "user" not in st.session_state:
