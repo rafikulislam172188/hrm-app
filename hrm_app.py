@@ -336,18 +336,65 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
 
 init()
 cur_ = S("currency")
+LOGIN_CSS = """<style>
+[data-testid="stHeader"],[data-testid="stSidebar"],[data-testid="collapsedControl"],[data-testid="stSidebarCollapsedControl"]{display:none}
+.stApp{background:#f3f6fb}
+.block-container{padding:0 !important;max-width:100% !important}
+[data-testid="stHorizontalBlock"]{gap:0 !important}
+.lg-left{min-height:100vh;box-sizing:border-box;padding:34px 56px;display:flex;flex-direction:column;justify-content:space-between;color:#fff;background:radial-gradient(circle at 88% 6%,rgba(255,255,255,.13) 0,rgba(255,255,255,0) 24%),radial-gradient(circle at 72% 60%,rgba(222,196,96,.30) 0,rgba(222,196,96,0) 16%),radial-gradient(circle at 6% 94%,rgba(70,110,210,.55) 0,rgba(70,110,210,0) 26%),linear-gradient(160deg,#0f2447 0%,#0f4c75 55%,#0e7c86 100%)}
+.lg-left,.lg-left *{color:#fff !important}
+.lg-brand{display:flex;align-items:center;gap:12px;font-size:17px}
+.lg-logo{display:inline-flex;align-items:center;justify-content:center;width:42px;height:42px;border-radius:12px;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.25);font-weight:800;font-size:15px}
+.lg-mid h1{font-size:46px;line-height:1.08;font-weight:800;margin:0 0 18px;padding:0;letter-spacing:-.02em}
+.lg-mid p{font-size:16px;line-height:1.6;max-width:470px;opacity:.9;margin:0 0 26px}
+.lg-mid ul{list-style:none;padding:0;margin:0}
+.lg-mid li{display:flex;align-items:center;gap:12px;margin:0 0 14px;font-size:15px}
+.lg-mid li i{font-style:normal;width:26px;height:26px;border-radius:8px;background:rgba(255,255,255,.14);display:inline-flex;align-items:center;justify-content:center;font-size:13px}
+.lg-foot{font-size:12px;opacity:.75}
+[data-testid="stColumn"]:nth-child(2)>[data-testid="stVerticalBlock"],[data-testid="column"]:nth-child(2)>div>[data-testid="stVerticalBlock"]{min-height:100vh;justify-content:center;padding:0 12%}
+[data-testid="stForm"]{background:#fff;border:none !important;border-radius:22px;padding:34px 32px 26px;box-shadow:0 20px 50px rgba(30,60,120,.12)}
+.lg-head{text-align:center;margin-bottom:10px}
+.lg-head h2{margin:12px 0 2px;padding:0;font-size:26px;font-weight:800;color:#0f2447 !important}
+.lg-head p{margin:0;color:#64748b !important;font-size:14px}
+.lg-head .lg-logo.big{width:58px;height:58px;border-radius:16px;font-size:20px;background:linear-gradient(135deg,#14808f,#2c6db3);color:#fff !important;border:none}
+[data-testid="stForm"] label p{font-size:11px !important;font-weight:700 !important;letter-spacing:.05em;text-transform:uppercase;color:#334155 !important}
+[data-testid="stTextInputRootElement"]{border-radius:12px;background:#f8fafc;border:1px solid #dbe3ee}
+[data-testid="stFormSubmitButton"] button{width:100%;height:48px;border:none;border-radius:12px;font-weight:700;background:linear-gradient(90deg,#14808f,#2c6db3);box-shadow:0 8px 18px rgba(30,110,170,.30)}
+[data-testid="stFormSubmitButton"] button p{color:#fff !important}
+</style>"""
+
 if "user" not in st.session_state:
-    st.title(f"🏢 {S('company')} - Login")
-    with st.form("login"):
-        u, p_ = st.text_input("Username"), st.text_input("Password", type="password")
-        if st.form_submit_button("Login"):
-            r_ = q("SELECT * FROM users WHERE username=? AND pw=?", (u, pw(p_)))
-            if len(r_):
-                st.session_state.user, st.session_state.role = u, r_.role[0]
-                st.rerun()
-            else:
-                st.error("Wrong username or password")
-    st.caption("First login: admin / admin123 (change it in Users)")
+    st.markdown(LOGIN_CSS, unsafe_allow_html=True)
+    nm_ = S("company")
+    ini = ("".join(w[0] for w in nm_.split()[:2]) or "HR").upper()
+    left, right = st.columns([1.15, 1], gap="small")
+    left.markdown(
+        f'<div class="lg-left"><div class="lg-brand"><span class="lg-logo">{html.escape(ini)}</span>'
+        f'<b>{html.escape(nm_)}</b></div><div class="lg-mid"><h1>Your whole workforce,<br>one clear dashboard.</h1>'
+        '<p>Attendance, leave, payroll and Iqama / ID dates for every company, section and kofil, '
+        'always up to date and always in one place.</p><ul>'
+        '<li><i>✓</i>Alerts before any Iqama / ID expires</li>'
+        '<li><i>✓</i>Company, section and kofil wise reports</li>'
+        '<li><i>✓</i>Custom date range on every page</li>'
+        '<li><i>✓</i>Secure sign in with your own access level</li></ul></div>'
+        f'<div class="lg-foot">© {html.escape(nm_)}</div></div>', unsafe_allow_html=True)
+    with right:
+        with st.form("login"):
+            st.markdown(f'<div class="lg-head"><span class="lg-logo big">{html.escape(ini)}</span>'
+                        '<h2>Welcome back</h2><p>Sign in to continue</p></div>', unsafe_allow_html=True)
+            u = st.text_input("Username", placeholder="👤  your username")
+            p_ = st.text_input("Password", type="password", placeholder="🔒  your password")
+            if st.form_submit_button("Sign in", use_container_width=True):
+                r_ = q("SELECT * FROM users WHERE username=? AND pw=?", (u.strip(), pw(p_)))
+                if len(r_):
+                    st.session_state.user, st.session_state.role = r_.username[0], r_.role[0]
+                    st.rerun()
+                else:
+                    st.error("Wrong username or password")
+        if q("SELECT COUNT(*) AS n FROM users WHERE username='admin' AND pw=?", (pw("admin123"),)).n[0]:
+            st.caption("First login: admin / admin123 - change it in Users after signing in.")
+        else:
+            st.caption("Forgot your password? Ask your administrator to reset it.")
     st.stop()
 role = st.session_state.role
 ALL = ["Dashboard", "Employees", "Setup", "Attendance", "Leave", "Adjustments", "Costs", "Payroll",
