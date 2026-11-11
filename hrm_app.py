@@ -45,7 +45,7 @@ _css = '[data-testid="stElementContainer"]:has(.cb){display:none}.element-contai
 for _k, _c in _COL.items():
     for _w in ('[data-testid="stElementContainer"]', ".element-container"):
         _s = f"{_w}:has(.cb-{_k}) + {_w}"
-        _css += (f'{_s}{{background:{_c};border-radius:14px;padding:0px 8px 8px;box-shadow:0 2px 6px rgba(0,0,0,.14)}}'
+        _css += (f'{_s}{{background:{_c};border-radius:10px;padding:0px 8px 8px;box-shadow:0 2px 6px rgba(0,0,0,.10)}}'
                  f'{_s} label p{{color:#fff !important;font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:.04em}}'
                  f'{_s} [data-baseweb="tag"]{{background-color:{_c} !important;color:#fff !important}}')
 st.markdown("<style>" + _css + "</style>", unsafe_allow_html=True)
