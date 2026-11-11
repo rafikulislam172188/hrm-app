@@ -39,20 +39,15 @@ st.markdown("""<style>
 [data-baseweb="select"]>div{background:#eaf5ee;border:1.5px solid #2e7d4f}
 [data-baseweb="tag"]{background-color:#2e7d4f !important;color:#fff !important}
 </style>""", unsafe_allow_html=True)
-_COL = {"co": ("#eaf2ff", "#2563eb", "#bfdbfe"), "sec": ("#fff3e6", "#ea580c", "#fed7aa"),
-        "spn": ("#f3eeff", "#7c3aed", "#ddd6fe"), "lab": ("#e8fbef", "#16a34a", "#bbf7d0"),
-        "pay": ("#fdeef6", "#db2777", "#fbcfe8"), "st": ("#fffbe0", "#ca8a04", "#fde68a")}
-# each coloured box is preceded by an invisible marker (<span class="cb cb-co">); CSS colours the box that follows it
+_COL = {"co": "#1f3a5f", "sec": "#e67e22", "spn": "#7d3c98", "lab": "#117a8b", "pay": "#2ea05a", "st": "#b7950b"}
+# each coloured frame is preceded by an invisible marker (<span class="cb cb-co">); CSS colours the frame that follows it
 _css = '[data-testid="stElementContainer"]:has(.cb){display:none}.element-container:has(.cb){display:none}'
-for _k, (_bg, _bd, _b2) in _COL.items():
+for _k, _c in _COL.items():
     for _w in ('[data-testid="stElementContainer"]', ".element-container"):
         _s = f"{_w}:has(.cb-{_k}) + {_w}"
-        _css += (f'{_s}{{background:{_bg};border:2px solid {_bd};border-radius:12px;padding:6px 10px 10px}}'
-                 f'{_s} [data-baseweb="select"]{{background:{_b2} !important;border:2px solid {_bd} !important;border-radius:10px}}'
-                 f'{_s} [data-baseweb="select"] div:not([data-baseweb="tag"]){{background:transparent !important;border-color:transparent !important}}'
-                 f'{_s} [data-baseweb="select"] input{{background:transparent !important;color:#1f2937 !important}}'
-                 f'{_s} [data-baseweb="tag"]{{background-color:{_bd} !important;color:#fff !important}}'
-                 f'{_s} label p{{color:{_bd};font-weight:700}}')
+        _css += (f'{_s}{{background:{_c};border-radius:14px;padding:10px 12px 12px;box-shadow:0 2px 6px rgba(0,0,0,.14)}}'
+                 f'{_s} label p{{color:#fff !important;font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:.04em}}'
+                 f'{_s} [data-baseweb="tag"]{{background-color:{_c} !important;color:#fff !important}}')
 st.markdown("<style>" + _css + "</style>", unsafe_allow_html=True)
 
 
