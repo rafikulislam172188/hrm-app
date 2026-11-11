@@ -369,7 +369,7 @@ LOGIN_CSS = """<style>
 [data-testid="stTextInputRootElement"]{border-radius:12px;background:#f8fafc;border:1px solid #dbe3ee}
 [data-testid="stFormSubmitButton"] button{width:100%;height:48px;border:none;border-radius:12px;font-weight:700;background:linear-gradient(90deg,#14808f,#2c6db3);box-shadow:0 8px 18px rgba(30,110,170,.30)}
 [data-testid="stFormSubmitButton"] button p{color:#fff !important}
-.lg-head p{color:#14808f !important;font-size:14px !important;font-weight:600 !important;}
+.lg-head p{color:#ff0000 !important;font-size:14px !important;font-weight:600 !important;}
 </style>"""
 
 if "user" not in st.session_state:
