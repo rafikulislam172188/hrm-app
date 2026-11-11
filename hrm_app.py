@@ -400,7 +400,7 @@ if "user" not in st.session_state:
                 else:
                     st.error("Wrong username or password")
         if q("SELECT COUNT(*) AS n FROM users WHERE username='admin' AND pw=?", (pw("admin123"),)).n[0]:
-            st.caption("First login: admin / admin123 - change it in Users after signing in.")
+            st.caption("Please Enter Your User name & Password and in Users after signing in.")
         else:
             st.caption("Forgot your password? Ask your administrator to reset it.")
     st.stop()
