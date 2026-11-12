@@ -91,7 +91,7 @@ def payslip_pdf(r, d1, d2):
     y = 800
     c.setFont("Helvetica-Bold", 16); c.drawString(50, y, f"{S('company')} - PAYSLIP"); y -= 25
     c.setFont("Helvetica", 11); c.drawString(50, y, f"Period: {d1} to {d2}"); y -= 30
-    money = {"Monthly Basic Rate", "Hr Rate", "OT Rate", "Basic", "Food", "OT Pay", "Wknd OT", "Allowances", "Bonus", "Advance", "Deduction", "Net"}
+    money = {"Monthly Basic", "Hr Rate", "OT Rate", "Basic", "Food", "OT Pay", "Wknd OT", "Allowances", "Bonus", "Advance", "Deduction", "Net"}
     for k in r.index:
         if k in ("Invoice", "Bank", "Cash"):
             continue
@@ -237,7 +237,7 @@ def apply_f(df, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
     return df
 
 
-RATECOLS = {"rate", "Rate", "Monthly Basic Rate", "Hr Rate", "OT Rate", "OT_Rate", "ot_rate", "bill_rate", "Rate/hr", "active",
+RATECOLS = {"rate", "Rate", "Monthly Basic", "Hr Rate", "OT Rate", "OT_Rate", "ot_rate", "bill_rate", "Rate/hr", "active",
             "id", "monthly_basic_rate", "hr_rate", "Years", "Monthly wage", "ot_rate_"}
 
 
@@ -316,7 +316,7 @@ def download(df, name, hdr=""):
 
 
 PCOLS = ["Code", "Name", "Iqama ID", "Passport No", "Company", "Section", "Sponsor", "Labour", "Pay", "Mode",
-         "Monthly Basic Rate", "Hr Rate", "OT Rate", "Days", "Leave", "Absent", "Normal Hrs", "OT Hrs", "Wknd Hrs",
+         "Monthly Basic", "Hr Rate", "OT Rate", "Days", "Leave", "Absent", "Normal Hrs", "OT Hrs", "Wknd Hrs",
          "Total Hrs", "Basic", "Food", "OT Pay", "Wknd OT", "Allowances", "Bonus", "Advance", "Deduction", "Net",
          "Bank", "Cash", "Invoice"]
 PVIEW = [c for c in PCOLS if c != "Invoice"]
@@ -330,7 +330,7 @@ def _wd(y, m, we):
 
 def view_pay(p):
     d = p[PVIEW].copy()
-    for c in ("Monthly Basic Rate", "Hr Rate"):
+    for c in ("Monthly Basic", "Hr Rate"):
         d[c] = d[c].where(d[c] != 0, "")
     return sign(d)
 
@@ -397,7 +397,7 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
             tot_h = reg_h + ot_h + wk_h
             rows.append({"Code": r.code, "Name": r["name"], "Iqama ID": r.id_no or "", "Passport No": r.passport_no or "",
                          "Company": nm(cn, cid), "Section": nm(sn, sid), "Sponsor": r.sponsor or "-", "Labour": r.labour_type,
-                         "Pay": r.pay_type, "Mode": r.pay_mode, "Monthly Basic Rate": r.rate if monthly else 0,
+                         "Pay": r.pay_type, "Mode": r.pay_mode, "Monthly Basic": r.rate if monthly else 0,
                          "Hr Rate": 0 if monthly else r.rate, "OT Rate": ot_rate_of(r.rate, r.pay_type, r.ot_rate, d2),
                          "Days": len(pres), "Leave": (g.status == "Leave").sum(), "Absent": (g.status == "Absent").sum(),
                          "Normal Hrs": reg_h, "OT Hrs": ot_h, "Wknd Hrs": wk_h, "Total Hrs": tot_h, "Basic": basic,
