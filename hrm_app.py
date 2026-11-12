@@ -39,13 +39,13 @@ st.markdown("""<style>
 [data-baseweb="select"]>div{background:#eaf5ee;border:1.5px solid #2e7d4f}
 [data-baseweb="tag"]{background-color:#2e7d4f !important;color:#fff !important}
 </style>""", unsafe_allow_html=True)
-_COL = {"co": "#1f3a5f", "sec": "#e67e22", "spn": "#7d3c98", "lab": "#117a8b", "pay": "#2ea05a", "st": "#b7950b", "dt": "#c0392b"}
+_COL = {"co": "#1f3a5f", "sec": "#e67e22", "spn": "#7d3c98", "lab": "#117a8b", "pay": "#2ea05a", "st": "#b7950b", "dt": "#64748b"}
 # each coloured frame is preceded by an invisible marker (<span class="cb cb-co">); CSS colours the frame that follows it
 _css = '[data-testid="stElementContainer"]:has(.cb){display:none}.element-container:has(.cb){display:none}'
 for _k, _c in _COL.items():
     for _w in ('[data-testid="stElementContainer"]', ".element-container"):
         _s = f"{_w}:has(.cb-{_k}) + {_w}"
-        _css += (f'{_s}{{background:{_c};border-radius:10px;padding:0px 8px 8px;box-shadow:0 2px 6px rgba(0,0,0,.10)}}'
+        _css += (f'{_s}{{background:{_c};border-radius:14px;padding:10px 12px 12px;box-shadow:0 2px 6px rgba(0,0,0,.14)}}'
                  f'{_s} label p{{color:#fff !important;font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:.04em}}'
                  f'{_s} [data-baseweb="tag"]{{background-color:{_c} !important;color:#fff !important}}')
 st.markdown("<style>" + _css + "</style>", unsafe_allow_html=True)
@@ -91,7 +91,7 @@ def payslip_pdf(r, d1, d2):
     y = 800
     c.setFont("Helvetica-Bold", 16); c.drawString(50, y, f"{S('company')} - PAYSLIP"); y -= 25
     c.setFont("Helvetica", 11); c.drawString(50, y, f"Period: {d1} to {d2}"); y -= 30
-    money = {"Rate", "Basic", "Food", "OT Pay", "Wknd OT", "Allowances", "Advance", "Deduction", "GOSI", "Net"}
+    money = {"Monthly Basic Rate", "Hr Rate", "OT Rate", "Basic", "Food", "OT Pay", "Wknd OT", "Allowances", "Bonus", "Advance", "Deduction", "Net"}
     for k in r.index:
         if k in ("Invoice", "Bank", "Cash"):
             continue
@@ -128,7 +128,7 @@ def init():
     q("CREATE TABLE IF NOT EXISTS costs(id INTEGER PRIMARY KEY, day TEXT, category TEXT, emp_id INT, company_id INT, amount REAL, note TEXT)", fetch=False)
     for t_, c_ in [("employees", "id_expiry TEXT"), ("employees", "company_id INT"), ("employees", "food_allow REAL DEFAULT 0"),
                    ("employees", "ot_rate REAL DEFAULT 0"), ("employees", "bill_rate REAL DEFAULT 0"),
-                   ("employees", "pay_mode TEXT DEFAULT 'Bank'"), ("attendance", "company_id INT"), ("attendance", "dept_id INT"), ("attendance", "ot_hours REAL")]:
+                   ("employees", "pay_mode TEXT DEFAULT 'Bank'"), ("attendance", "company_id INT"), ("attendance", "dept_id INT"), ("attendance", "ot_hours REAL"), ("employees", "passport_no TEXT")]:
         try:
             q(f"ALTER TABLE {t_} ADD COLUMN {c_}", fetch=False)
         except Exception:
@@ -157,8 +157,7 @@ def hrs(i, o):
 
 def emp_df(active=True):
     return q("""SELECT e.id, e.code, e.name, c.name AS company, d.name AS section, s.name AS sponsor, e.labour_type,
-        e.pay_type, e.pay_mode, e.rate, e.food_allow, e.ot_rate, e.bill_rate, e.nationality, e.id_no, e.phone,
-        e.join_date, e.id_expiry, e.company_id, e.dept_id, e.sponsor_id
+        e.pay_type, e.pay_mode, e.rate, e.food_allow, e.ot_rate, e.bill_rate, e.nationality, e.id_no, e.passport_no, e.phone, e.join_date, e.id_expiry, e.company_id, e.dept_id, e.sponsor_id
         FROM employees e LEFT JOIN companies c ON c.id=e.company_id LEFT JOIN departments d ON d.id=e.dept_id
         LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE e.active=?""", (1 if active else 0,))
 
@@ -238,56 +237,117 @@ def apply_f(df, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
     return df
 
 
-def df_pdf(df, title):
+RATECOLS = {"rate", "Rate", "Monthly Basic Rate", "Hr Rate", "OT Rate", "OT_Rate", "ot_rate", "bill_rate", "Rate/hr", "active",
+            "id", "monthly_basic_rate", "hr_rate", "Years", "Monthly wage", "ot_rate_"}
+
+
+def add_total(df):
+    """Append a TOTAL row (sum of every numeric column except rates)."""
+    if df.empty or df.iloc[:, 0].astype(str).str.upper().str.startswith("TOTAL").any():
+        return df
+    isn = lambda c: pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_bool_dtype(df[c])
+    num = [c for c in df.columns if isn(c) and c not in RATECOLS and "rate" not in str(c).lower()]
+    if not num:
+        return df
+    t = {c: (float("nan") if isn(c) else "") for c in df.columns}
+    t.update({c: round(float(df[c].sum()), 2) for c in num})
+    t[next((c for c in df.columns if not isn(c)), df.columns[0])] = f"TOTAL ({len(df)})"
+    return pd.concat([df, pd.DataFrame([t])], ignore_index=True)
+
+
+def sign(df):
+    df = df.copy()
+    df["Signature"], df["Finger"] = "", ""
+    return df
+
+
+def hdr_of(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
+    j = lambda x: ", ".join(x) if x else "All"
+    return (f"Period: {d1} to {d2}   |   Company: {j(co)}   |   Kofil: {j(spn)}   |   Section: {j(sec)}   |   "
+            f"Labour: {j(lt)}   |   Pay type: {j(pt)}")
+
+
+def df_pdf(df, title, hdr=""):
+    """One landscape page whenever possible: font and column widths shrink to fit; header shows the selected filters."""
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A3, A4, landscape
-    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-    b, n = io.BytesIO(), max(len(df.columns), 1)
-    ps = landscape(A3 if n > 18 else A4)
-    doc = SimpleDocTemplate(b, pagesize=ps, leftMargin=20, rightMargin=20, topMargin=20, bottomMargin=20)
-    fs = 8 if n <= 10 else (7 if n <= 18 else 6)
-    w = (ps[0] - 40) / n
-    cut = max(4, int(w / (fs * 0.52)))
-    fmt = lambda v: "" if pd.isna(v) else (f"{v:,.2f}" if isinstance(v, float) else str(v))[:cut]
-    data = [[str(c)[:cut] for c in df.columns]] + [[fmt(v) for v in row] for row in df.itertuples(index=False)]
-    t = Table(data, colWidths=[w] * n, repeatRows=1)
-    t.setStyle(TableStyle([("FONTSIZE", (0, 0), (-1, -1), fs), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#14472f")),
-                           ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                           ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#eef5ef")])]))
+    b, n, m = io.BytesIO(), max(len(df.columns), 1), 16
+    W, H = landscape(A3 if n > 14 else A4)
+    fmt = lambda v: "" if pd.isna(v) else (f"{v:,.2f}" if isinstance(v, float) else str(v))
+    data = [[str(c) for c in df.columns]] + [[fmt(v)[:24] for v in row] for row in df.itertuples(index=False)]
+    lens = [max(3, max(len(r_[i]) for r_ in data)) for i in range(n)]
+    fs = 8.0
+    while True:
+        wid = [l * fs * 0.55 + 5 for l in lens]
+        rh = fs * 1.15 + 3
+        if (sum(wid) <= W - 2 * m and rh * len(data) <= H - 2 * m - 85) or fs <= 4:
+            break
+        fs -= 0.5
+    k = min((W - 2 * m) / sum(wid), 1.5)
+    t = Table(data, colWidths=[w * k for w in wid], repeatRows=1)
+    st_ = [("FONTSIZE", (0, 0), (-1, -1), fs), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#14472f")),
+           ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+           ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+           ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2)]
+    if len(data) > 1 and data[-1][0].startswith("TOTAL"):
+        st_ += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#dfeee4"))]
+    t.setStyle(TableStyle(st_))
     sty = getSampleStyleSheet()
-    doc.build([Paragraph(f"{S('company')} - {title}", sty["Title"]),
-               Paragraph(f"Generated {today()}  |  {len(df)} rows", sty["Normal"]), Spacer(1, 8), t])
+    sm = ParagraphStyle("sm", parent=sty["Normal"], fontSize=8, leading=10)
+    SimpleDocTemplate(b, pagesize=(W, H), leftMargin=m, rightMargin=m, topMargin=m, bottomMargin=m).build([
+        Paragraph(f"<b>{S('company')} - {title}</b>", ParagraphStyle("h", parent=sty["Title"], fontSize=14, leading=16, spaceAfter=2)),
+        Paragraph(hdr, sm), Paragraph(f"Printed {today()}  |  {len(df) - (1 if len(data) > 1 and data[-1][0].startswith('TOTAL') else 0)} rows", sm),
+        Spacer(1, 4), t])
     return b.getvalue()
 
 
-def download(df, name):
+def download(df, name, hdr=""):
+    df = add_total(df)
     c = st.columns([1, 1, 6])
     c[0].download_button("⬇ CSV", df.to_csv(index=False).encode("utf-8-sig"), f"{name}_{today()}.csv", "text/csv",
                          key="csv_" + name)
     try:
-        c[1].download_button("⬇ PDF", df_pdf(df, name.replace("_", " ")), f"{name}_{today()}.pdf", "application/pdf",
-                             key="pdf_" + name)
+        c[1].download_button("⬇ PDF (print)", df_pdf(df, name.replace("_", " "), hdr), f"{name}_{today()}.pdf",
+                             "application/pdf", key="pdf_" + name)
     except ImportError:
         c[1].caption("pip install reportlab")
 
 
-PCOLS = ["Code", "Name", "Company", "Section", "Sponsor", "Labour", "Pay", "Mode", "Rate", "Days", "Leave", "Absent",
-         "Hours", "OT Hrs", "Wknd Hrs", "Basic", "Food", "OT Pay", "Wknd OT", "Allowances", "Advance", "Deduction",
-         "GOSI", "Net", "Bank", "Cash", "Invoice"]
+PCOLS = ["Code", "Name", "Iqama ID", "Passport No", "Company", "Section", "Sponsor", "Labour", "Pay", "Mode",
+         "Monthly Basic Rate", "Hr Rate", "OT Rate", "Days", "Leave", "Absent", "Normal Hrs", "OT Hrs", "Wknd Hrs",
+         "Total Hrs", "Basic", "Food", "OT Pay", "Wknd OT", "Allowances", "Bonus", "Advance", "Deduction", "Net",
+         "Bank", "Cash", "Invoice"]
+PVIEW = [c for c in PCOLS if c != "Invoice"]
+
+
+def _wd(y, m, we):
+    """Working days of a calendar month = days in month minus weekend days (31 days - 4 Fridays = 27)."""
+    n = calendar.monthrange(y, m)[1]
+    return n - sum(date(y, m, k).weekday() == we for k in range(1, n + 1))
+
+
+def view_pay(p):
+    d = p[PVIEW].copy()
+    for c in ("Monthly Basic Rate", "Hr Rate"):
+        d[c] = d[c].where(d[c] != 0, "")
+    return sign(d)
 
 
 def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
-    """Per employee x company x section (from daily attendance), for any date range."""
+    """Monthly staff: basic & food = amount / working days of that month x (present + leave days), weekend work = OT only,
+    absent days unpaid, one day's basic as bonus for a full working month (all places together).
+    Hourly staff: normal hours x rate, OT / weekend hours x OT rate (own OT rate, else normal rate)."""
     e = apply_f(emp_df(), (), lt, pt, spn, (), qs)
     att = q("SELECT * FROM attendance WHERE day BETWEEN ? AND ?", (d1, d2))
     adj = q("SELECT * FROM adjustments WHERE day BETWEEN ? AND ?", (d1, d2))
     cn = dict(q("SELECT id,name FROM companies").values)
     sn = dict(q("SELECT id,name FROM departments").values)
     nm = lambda d, k: d.get(int(k), "-") if pd.notna(k) else "-"
-    std, otm, wd, we = float(S("std_hours")), float(S("ot_mult")), float(S("work_days")), int(S("weekend"))
+    std, otm, we = float(S("std_hours")), float(S("ot_mult")), int(S("weekend"))
     gp, gn = float(S("gosi_pct")), S("gosi_nat").strip().lower()
-    months = max(1, round(((date.fromisoformat(d2) - date.fromisoformat(d1)).days + 1) / 30.4))
+    D1, D2 = date.fromisoformat(d1), date.fromisoformat(d2)
     rows = []
     for _, r in e.iterrows():
         a = att[att.emp_id == r.id].copy()
@@ -295,47 +355,55 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
             continue
         a["cid"], a["sid"] = a.company_id.fillna(r.company_id), a.dept_id.fillna(r.dept_id)
         a["ot_hours"], a["hours"] = a.ot_hours.fillna(0), a.hours.fillna(0)
+        a["m"], a["wk"] = a.day.str[:7], pd.to_datetime(a.day).dt.weekday == we
         ad = adj[adj.emp_id == r.id]
-        tp = max((a.status == "Present").sum(), 1)
+        monthly = r.pay_type == "Monthly"
+        full = set()
+        if monthly:
+            for mth in a.m.unique():
+                y_, m_ = int(mth[:4]), int(mth[5:])
+                if date(y_, m_, 1) >= D1 and date(y_, m_, calendar.monthrange(y_, m_)[1]) <= D2:
+                    if len(a[(a.m == mth) & (a.status == "Present") & ~a.wk]) >= _wd(y_, m_, we):
+                        full.add(mth)
         first = True
         for (cid, sid), g in a.groupby(["cid", "sid"], dropna=False):
             pres = g[g.status == "Present"]
-            wkd = pres[pd.to_datetime(pres.day).dt.weekday == we]
-            nor = pres.drop(wkd.index)
-            ot_h, wk_h = nor.ot_hours.sum(), (wkd.hours + wkd.ot_hours).sum()
-            reg_h = nor.hours.sum()
-            ld = (g.status == "Leave").sum()
-            g = g.assign(m=g.day.str[:7], wk=pd.to_datetime(g.day).dt.weekday == we)
-            if r.pay_type == "Monthly":
-                # salary / (days in that month - weekend days) per paid day; weekend work = OT only
-                basic = ot_pay = wk_pay = 0.0
+            wkd, nor = pres[pres.wk], pres[~pres.wk]
+            ot_h, wk_h, reg_h = nor.ot_hours.sum(), (wkd.hours + wkd.ot_hours).sum(), nor.hours.sum()
+            basic = food = bonus = ot_pay = wk_pay = 0.0
+            if monthly:
                 for mth, gm in g.groupby("m"):
                     y_, m_ = int(mth[:4]), int(mth[5:])
-                    nd_ = calendar.monthrange(y_, m_)[1]
-                    wd_m = nd_ - sum(date(y_, m_, k).weekday() == we for k in range(1, nd_ + 1))
-                    otr = r.ot_rate if r.ot_rate > 0 else r.rate / wd_m / std * otm
+                    wdm = _wd(y_, m_, we)
+                    otr = r.ot_rate if r.ot_rate > 0 else r.rate / wdm / std * otm
                     p_, w_ = gm[(gm.status == "Present") & ~gm.wk], gm[(gm.status == "Present") & gm.wk]
-                    basic += r.rate / wd_m * (len(p_) + len(gm[(gm.status == "Leave") & ~gm.wk]))
+                    paid = len(p_) + len(gm[(gm.status == "Leave") & ~gm.wk])
+                    basic += r.rate / wdm * paid
+                    food += r.food_allow / wdm * paid
                     ot_pay += p_.ot_hours.sum() * otr
                     wk_pay += (w_.hours + w_.ot_hours).sum() * otr
-                food = r.food_allow * months * len(pres) / tp
-            elif r.ot_rate > 0:     # Hourly with its own OT rate
-                basic, ot_pay, wk_pay, food = reg_h * r.rate, ot_h * r.ot_rate, wk_h * r.ot_rate, 0
-            else:                   # Hourly: no month basis, all hours worked x rate
-                basic, ot_pay, wk_pay, food = (reg_h + ot_h + wk_h) * r.rate, 0, 0, 0
+                    if mth in full:
+                        bonus += r.rate / wdm * len(p_) / wdm
+            elif r.ot_rate > 0:
+                basic, ot_pay, wk_pay = reg_h * r.rate, ot_h * r.ot_rate, wk_h * r.ot_rate
+            else:
+                basic = (reg_h + ot_h + wk_h) * r.rate
             add = ad[~ad.kind.isin(["Advance", "Deduction"])].amount.sum() if first else 0
             adv = ad[ad.kind == "Advance"].amount.sum() if first else 0
             ded = ad[ad.kind == "Deduction"].amount.sum() if first else 0
             first = False
-            gosi = basic * gp / 100 if str(r.nationality).strip().lower() == gn else 0
-            net = basic + food + ot_pay + wk_pay + add - adv - ded - gosi
-            rows.append({"Code": r.code, "Name": r["name"], "Company": nm(cn, cid), "Section": nm(sn, sid),
-                         "Sponsor": r.sponsor or "-", "Labour": r.labour_type, "Pay": r.pay_type, "Mode": r.pay_mode,
-                         "Rate": r.rate, "Days": len(pres), "Leave": ld, "Absent": (g.status == "Absent").sum(),
-                         "Hours": (pres.hours + pres.ot_hours).sum(), "OT Hrs": ot_h, "Wknd Hrs": wk_h, "Basic": basic, "Food": food,
-                         "OT Pay": ot_pay, "Wknd OT": wk_pay, "Allowances": add, "Advance": adv,
-                         "Deduction": ded, "GOSI": gosi, "Net": net, "Bank": net if r.pay_mode == "Bank" else 0,
-                         "Cash": net if r.pay_mode != "Bank" else 0, "Invoice": (pres.hours + pres.ot_hours).sum() * r.bill_rate})
+            ded += basic * gp / 100 if str(r.nationality).strip().lower() == gn else 0
+            net = basic + food + bonus + ot_pay + wk_pay + add - adv - ded
+            tot_h = reg_h + ot_h + wk_h
+            rows.append({"Code": r.code, "Name": r["name"], "Iqama ID": r.id_no or "", "Passport No": r.passport_no or "",
+                         "Company": nm(cn, cid), "Section": nm(sn, sid), "Sponsor": r.sponsor or "-", "Labour": r.labour_type,
+                         "Pay": r.pay_type, "Mode": r.pay_mode, "Monthly Basic Rate": r.rate if monthly else 0,
+                         "Hr Rate": 0 if monthly else r.rate, "OT Rate": ot_rate_of(r.rate, r.pay_type, r.ot_rate, d2),
+                         "Days": len(pres), "Leave": (g.status == "Leave").sum(), "Absent": (g.status == "Absent").sum(),
+                         "Normal Hrs": reg_h, "OT Hrs": ot_h, "Wknd Hrs": wk_h, "Total Hrs": tot_h, "Basic": basic,
+                         "Food": food, "OT Pay": ot_pay, "Wknd OT": wk_pay, "Allowances": add, "Bonus": bonus,
+                         "Advance": adv, "Deduction": ded, "Net": net, "Bank": net if r.pay_mode == "Bank" else 0,
+                         "Cash": net if r.pay_mode != "Bank" else 0, "Invoice": tot_h * r.bill_rate})
     df = pd.DataFrame(rows, columns=PCOLS).round(2)
     if sec: df = df[df.Section.isin(sec)]
     if co: df = df[df.Company.isin(co)]
@@ -360,7 +428,7 @@ LOGIN_CSS = """<style>
 .lg-mid li i{font-style:normal;width:26px;height:26px;border-radius:8px;background:rgba(255,255,255,.14);display:inline-flex;align-items:center;justify-content:center;font-size:13px}
 .lg-foot{font-size:12px;opacity:.75}
 [data-testid="stColumn"]:nth-child(2)>[data-testid="stVerticalBlock"],[data-testid="column"]:nth-child(2)>div>[data-testid="stVerticalBlock"]{min-height:100vh;justify-content:center;padding:0 12%}
-[data-testid="stForm"]{background:#fff;border:none !important;border-radius:22px;padding:34px 32px 26px;width:105%;max-width:380px;margin:auto;box-sizing:border-box;box-shadow:0 20px 50px rgba(30,60,120,.12);}
+[data-testid="stForm"]{background:#fff;border:none !important;border-radius:22px;padding:34px 32px 26px;box-shadow:0 20px 50px rgba(30,60,120,.12)}
 .lg-head{text-align:center;margin-bottom:10px}
 .lg-head h2{margin:12px 0 2px;padding:0;font-size:26px;font-weight:800;color:#0f2447 !important}
 .lg-head p{margin:0;color:#64748b !important;font-size:14px}
@@ -369,7 +437,6 @@ LOGIN_CSS = """<style>
 [data-testid="stTextInputRootElement"]{border-radius:12px;background:#f8fafc;border:1px solid #dbe3ee}
 [data-testid="stFormSubmitButton"] button{width:100%;height:48px;border:none;border-radius:12px;font-weight:700;background:linear-gradient(90deg,#14808f,#2c6db3);box-shadow:0 8px 18px rgba(30,110,170,.30)}
 [data-testid="stFormSubmitButton"] button p{color:#fff !important}
-.lg-head p{color:#ff0000 !important;font-size:14px !important;font-weight:600 !important;}
 </style>"""
 
 if "user" not in st.session_state:
@@ -401,9 +468,9 @@ if "user" not in st.session_state:
                 else:
                     st.error("Wrong username or password")
         if q("SELECT COUNT(*) AS n FROM users WHERE username='admin' AND pw=?", (pw("admin123"),)).n[0]:
-    st.caption("Please Enter Your User name & Password Users after signing in.")
-else:
-    st.caption("Forgot your password? Ask your administrator to reset it.")
+            st.caption("First login: admin / admin123 - change it in Users after signing in.")
+        else:
+            st.caption("Forgot your password? Ask your administrator to reset it.")
     st.stop()
 role = st.session_state.role
 ALL = ["Dashboard", "Employees", "Setup", "Attendance", "Leave", "Adjustments", "Costs", "Payroll",
@@ -499,35 +566,46 @@ if page == "Dashboard":
 # ---------------- Employees
 elif page == "Employees":
     st.header("Employees / Labour")
+    if st.session_state.get("flash_emp"):
+        st.success(st.session_state.pop("flash_emp"))
     cm, ds, sp = q("SELECT * FROM companies"), q("SELECT * FROM departments"), q("SELECT * FROM sponsors")
     pick = lambda t, n: None if n == "-" else int(t[t.name == n].id.iloc[0])
+    v = st.session_state.get("empv", 0)
     with st.expander("➕ Add / update employee (same code = update)"):
-        with st.form("emp"):
-            c = st.columns(4)
-            code, name = c[0].text_input("Code"), c[1].text_input("Name")
-            nat, idn = c[2].text_input("Nationality"), c[3].text_input("ID / Iqama / Residence no.")
-            co = c[0].selectbox("Client company", ["-"] + cm.name.tolist())
-            sec = c[1].selectbox("Section", ["-"] + ds.name.tolist())
-            spn = c[2].selectbox("Sponsor / Kofil", ["-"] + sp.name.tolist())
-            lt = c[3].selectbox("Labour type", ["Company", "Outside"])
-            pt = c[0].selectbox("Pay type", ["Monthly", "Hourly"])
-            pm = c[1].selectbox("Pay mode", ["Bank", "Cash"])
-            rate = c[2].number_input("Rate (monthly basic; per hour if Hourly)", 0.0)
-            food = c[3].number_input("Food allowance / month", 0.0)
-            otr = c[0].number_input("OT rate / hour (0 = auto)", 0.0)
-            bill = c[1].number_input("Bill rate / hour (client invoice)", 0.0)
-            ph, jd = c[2].text_input("Phone"), c[3].date_input("Join date", today())
-            exp = c[0].date_input("ID expiry", today() + timedelta(days=365))
-            if st.form_submit_button("Save") and code and name:
-                save_emp(dict(code=code, name=name, nationality=nat, id_no=idn, company_id=pick(cm, co),
-                              dept_id=pick(ds, sec), sponsor_id=pick(sp, spn), labour_type=lt, pay_type=pt,
-                              pay_mode=pm, rate=rate, food_allow=food, ot_rate=otr, bill_rate=bill, phone=ph,
-                              join_date=str(jd), id_expiry=str(exp)))
-                st.success("Saved"); st.rerun()
+        c = st.columns(4)
+        code, name = c[0].text_input("Code", key=f"e1{v}"), c[1].text_input("Name", key=f"e2{v}")
+        nat, idn = c[2].text_input("Nationality", key=f"e3{v}"), c[3].text_input("ID / Iqama no.", key=f"e4{v}")
+        pas = c[0].text_input("Passport no.", key=f"e5{v}")
+        co = c[1].selectbox("Client company", ["-"] + cm.name.tolist(), key=f"e6{v}")
+        sec = c[2].selectbox("Section", ["-"] + ds.name.tolist(), key=f"e7{v}")
+        spn = c[3].selectbox("Sponsor / Kofil", ["-"] + sp.name.tolist(), key=f"e8{v}")
+        lt = c[0].selectbox("Labour type", ["Company", "Outside"], key=f"e9{v}")
+        pt = c[1].selectbox("Pay type", ["Monthly", "Hourly"], key=f"e10{v}")
+        pm = c[2].selectbox("Pay mode", ["Bank", "Cash"], key=f"e11{v}")
+        rate = c[3].number_input("Normal hour rate (per hour)" if pt == "Hourly" else "Monthly basic salary", 0.0,
+                                 key=f"e12{v}{pt}")
+        food = c[0].number_input("Food allowance / month" + (" (monthly staff only)" if pt == "Hourly" else ""), 0.0,
+                                 key=f"e13{v}", disabled=pt == "Hourly")
+        otr = c[1].number_input("OT rate / hour (0 = auto)", 0.0, key=f"e14{v}")
+        bill = c[2].number_input("Bill rate / hour (client invoice)", 0.0, key=f"e15{v}")
+        ph, jd = c[3].text_input("Phone", key=f"e16{v}"), c[0].date_input("Join date", today(), key=f"e17{v}")
+        exp = c[1].date_input("ID expiry", today() + timedelta(days=365), key=f"e18{v}")
+        if st.button("💾 Save employee", key=f"esave{v}") and code and name:
+            save_emp(dict(code=code, name=name, nationality=nat, id_no=idn, passport_no=pas, company_id=pick(cm, co),
+                          dept_id=pick(ds, sec), sponsor_id=pick(sp, spn), labour_type=lt, pay_type=pt, pay_mode=pm,
+                          rate=rate, food_allow=0.0 if pt == "Hourly" else food, ot_rate=otr, bill_rate=bill, phone=ph,
+                          join_date=str(jd), id_expiry=str(exp)))
+            st.session_state["empv"], st.session_state["flash_emp"] = v + 1, f"Saved {code}"
+            st.rerun()
     f = filters("emp")
     df = apply_f(emp_df(), *f[2:]).drop(columns=["id", "company_id", "dept_id", "sponsor_id"])
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    download(df, "employees")
+    df["monthly_basic_rate"], df["hr_rate"] = df.rate.where(df.pay_type == "Monthly", 0), df.rate.where(df.pay_type == "Hourly", 0)
+    df = df.rename(columns={"id_no": "iqama_id"})[["code", "name", "iqama_id", "passport_no", "company", "section", "sponsor",
+                                                   "labour_type", "pay_type", "pay_mode", "monthly_basic_rate", "hr_rate",
+                                                   "ot_rate", "food_allow", "bill_rate", "nationality", "phone",
+                                                   "join_date", "id_expiry"]]
+    st.dataframe(add_total(df), use_container_width=True, hide_index=True)
+    download(df, "employees", hdr_of(*f[:7]))
     if len(df):
         x = st.selectbox("Deactivate employee", df.code + " - " + df["name"])
         if st.button("Deactivate"):
@@ -572,7 +650,8 @@ elif page == "Attendance":
     with c[3]:
         fspn = msel("Sponsor / Kofil *", kl, "att_spn", False, "Select (required)")
     with c[4]:
-        fst = msel("Status filter", list(LBL.values()) + ["Not marked"], "att_st")
+        st.markdown('<span class="cb cb-st"></span>', unsafe_allow_html=True)
+        pick = st.selectbox("Set status for ALL", ["—"] + list(LBL.values()), key="att_st")
     qs = st.text_input("🔎 Search code / name", key="att_q")
     if not (fco and fsec and fspn):
         st.warning("Company, Section and Sponsor / Kofil are mandatory. Select them (or choose 'All') "
@@ -588,23 +667,23 @@ elif page == "Attendance":
             o = old[old.emp_id == r.id]
             h = o.iloc[0] if len(o) else None
             cur = CODE.get(h["status"], "P") if h is not None else None
-            if eff(fst) and (LBL[cur] if cur else "Not marked") not in fst:
-                continue
             g = lambda col, dflt: h[col] if h is not None and pd.notna(h[col]) else dflt
-            stt = cur or ("O" if wkend else "P")
-            sv = h is not None and stt == "P"
-            rows.append({"id": r.id, "Code": r.code, "Name": r["name"], "Labour": r.labour_type, "Sponsor": r.sponsor or "",
-                         "Company": nm(g("company_id", None), cn) or (r.company or ""),
+            stt = pick[-1] if pick != "—" else (cur or ("O" if wkend else "P"))
+            sv = cur == "P" and stt == "P"
+            nh, oh = (float(g("hours", dn)), float(g("ot_hours", 0.0))) if sv else (dn, do_)
+            rows.append({"id": r.id, "Code": r.code, "Name": r["name"], "Iqama ID": r.id_no or "",
+                         "Passport No": r.passport_no or "", "Pay Type": r.pay_type, "Labour": r.labour_type,
+                         "Sponsor": r.sponsor or "", "Company": nm(g("company_id", None), cn) or (r.company or ""),
                          "Section": nm(g("dept_id", None), sn) or (r.section or ""),
                          "OT Rate": ot_rate_of(r.rate, r.pay_type, r.ot_rate, str(day)), "Status": LBL[stt],
-                         "Normal Hrs": float(g("hours", dn)) if sv else dn,
-                         "OT Hrs": float(g("ot_hours", 0.0)) if sv else do_})
+                         "Normal Hrs": nh, "OT Hrs": oh, "Total Hrs": nh + oh if stt == "P" else 0.0})
         if wkend:
             st.info("This date is the weekend day: everyone starts as O (no work, no pay). Change to P only for those "
                     "who worked - all their hours are then paid as OT.")
         ed = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True,
-                            key=f"att{day}{fco}{fsec}{fspn}{fst}{qs}",
-                            disabled=["id", "Code", "Name", "Labour", "Sponsor", "OT Rate"],
+                            key=f"att{day}{fco}{fsec}{fspn}{pick}{qs}",
+                            disabled=["id", "Code", "Name", "Iqama ID", "Passport No", "Pay Type", "Labour", "Sponsor",
+                                      "OT Rate", "Total Hrs"],
                             column_config={"id": None,
                                            "Company": st.column_config.SelectboxColumn(options=[""] + cl),
                                            "Section": st.column_config.SelectboxColumn(options=[""] + sl),
@@ -612,10 +691,26 @@ elif page == "Attendance":
                                                                                       help="P=Present, A=Absent, L=Leave, O=Off"),
                                            "Normal Hrs": st.column_config.NumberColumn(min_value=0.0, max_value=24.0, step=0.5),
                                            "OT Hrs": st.column_config.NumberColumn(min_value=0.0, max_value=16.0, step=0.5)})
-        st.caption("🟢 P = Present (paid), 🟡 L = Leave (paid), 🔴 A = Absent (not paid), ⚪ O = Off (not paid). Normal and "
-                   "OT hours are pre-filled from Settings - change per person if different. Monthly staff are paid per "
-                   "day; OT hours are paid extra. Weekend day: no work = no pay, work = all hours paid as OT. "
-                   "Hourly staff: no month basis - total hours worked x hourly rate.")
+        if len(ed):
+            sc = ed.Status.str[-1]
+            isp = sc == "P"
+            nh_, oh_ = ed["Normal Hrs"].where(isp, 0.0), ed["OT Hrs"].where(isp, 0.0)
+            st.dataframe(pd.DataFrame([{"TOTAL": f"{len(ed)} staff", "P": int(isp.sum()), "A": int((sc == "A").sum()),
+                                        "L": int((sc == "L").sum()), "O": int((sc == "O").sum()),
+                                        "Normal Hrs": round(nh_.sum(), 2), "OT Hrs": round(oh_.sum(), 2),
+                                        "Total Hrs": round((nh_ + oh_).sum(), 2)}]), hide_index=True, use_container_width=True)
+            sheet = sign(ed.drop(columns=["id"]).assign(Status=sc, **{"Normal Hrs": nh_, "OT Hrs": oh_, "Total Hrs": nh_ + oh_}))
+            try:
+                st.download_button("🖨 Attendance sheet PDF (print)",
+                                   df_pdf(add_total(sheet), f"Attendance {day}",
+                                          hdr_of(str(day), str(day), eff(fsec, sl), (), (), eff(fspn, kl), eff(fco, cl))),
+                                   f"attendance_{day}.pdf", "application/pdf", key="att_pdf")
+            except ImportError:
+                st.caption("pip install reportlab")
+        st.caption("🟢 P = Present (paid), 🟡 L = Leave (paid), 🔴 A = Absent (not paid), ⚪ O = Off (not paid). "
+                   "'Set status for ALL' fills every row with the chosen status - then change single rows if needed. "
+                   "Normal / OT hours are pre-filled from Settings (default 10 + 2). Total Hrs updates after Save. "
+                   "Weekend day: no work = no pay, work = all hours paid as OT.")
         if st.button("💾 Save attendance"):
             for _, r in ed.iterrows():
                 code = r.Status[-1]
@@ -646,7 +741,7 @@ elif page == "Leave":
         LEFT JOIN departments d ON d.id=e.dept_id LEFT JOIN sponsors s ON s.id=e.sponsor_id LEFT JOIN companies c ON c.id=e.company_id
         WHERE l.start<=? AND l.end>=?""", (d2, d1))
     df = apply_f(df, sec, lt, pt, spn, co, qs)
-    st.dataframe(df, use_container_width=True, hide_index=True); download(df, "leave")
+    st.dataframe(add_total(df), use_container_width=True, hide_index=True); download(df, "leave", hdr_of(d1, d2, sec, lt, pt, spn, co))
     pend = df[df.status == "Pending"]
     if len(pend):
         i = st.selectbox("Pending request ID", pend.id)
@@ -685,8 +780,8 @@ elif page == "Adjustments":
         LEFT JOIN departments d ON d.id=e.dept_id LEFT JOIN sponsors s ON s.id=e.sponsor_id LEFT JOIN companies c ON c.id=e.company_id
         WHERE a.day BETWEEN ? AND ?""", (f[0], f[1]))
     df = apply_f(df, *f[2:])
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    download(df, "adjustments")
+    st.dataframe(add_total(df), use_container_width=True, hide_index=True)
+    download(df, "adjustments", hdr_of(*f[:7]))
     rid = st.number_input("Delete entry ID", 0, step=1)
     if st.button("Delete entry") and rid:
         q("DELETE FROM adjustments WHERE id=?", (int(rid),), fetch=False)
@@ -714,17 +809,18 @@ elif page == "Users":
 elif page == "Payroll":
     st.header("Payroll")
     f = filters("pay")
-    df = calc_payroll(*f)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    raw = calc_payroll(*f)
+    df = view_pay(raw)
+    st.dataframe(add_total(df), use_container_width=True, hide_index=True)
     if len(df):
         c = st.columns(3)
-        c[0].metric("Total Net", f"{df.Net.sum():,.2f} {cur_}")
-        c[1].metric("Company labour", f"{df[df.Labour == 'Company'].Net.sum():,.2f} {cur_}")
-        c[2].metric("Outside labour", f"{df[df.Labour == 'Outside'].Net.sum():,.2f} {cur_}")
-        download(df, "payroll")
-        sel = st.selectbox("Payslip for", df.Code + " - " + df.Name)
+        c[0].metric("Total Net", f"{raw.Net.sum():,.2f} {cur_}")
+        c[1].metric("Company labour", f"{raw[raw.Labour == 'Company'].Net.sum():,.2f} {cur_}")
+        c[2].metric("Outside labour", f"{raw[raw.Labour == 'Outside'].Net.sum():,.2f} {cur_}")
+        download(df, "payroll", hdr_of(*f[:7]))
+        sel = st.selectbox("Payslip for", raw.Code + " - " + raw.Name)
         try:
-            row = df[df.Code == sel.split(" - ")[0]].iloc[0]
+            row = raw[raw.Code == sel.split(" - ")[0]].iloc[0]
             st.download_button("🧾 Download payslip PDF", payslip_pdf(row, f[0], f[1]),
                                f"payslip_{row.Code}_{f[0]}_{f[1]}.pdf", "application/pdf")
         except ImportError:
@@ -753,9 +849,9 @@ elif page == "Costs":
         LEFT JOIN companies c ON c.id=x.company_id LEFT JOIN departments d ON d.id=e.dept_id
         LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE x.day BETWEEN ? AND ?""", (f[0], f[1]))
     df = apply_f(df, *f[2:])
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    st.dataframe(df.groupby("category").amount.sum().reset_index(), hide_index=True)
-    download(df, "costs")
+    st.dataframe(add_total(df), use_container_width=True, hide_index=True)
+    st.dataframe(add_total(df.groupby("category").amount.sum().reset_index()), hide_index=True)
+    download(df, "costs", hdr_of(*f[:7]))
     rid = st.number_input("Delete cost ID", 0, step=1)
     if st.button("Delete cost") and rid:
         q("DELETE FROM costs WHERE id=?", (int(rid),), fetch=False); st.rerun()
@@ -767,7 +863,7 @@ elif page == "Invoices":
     p = calc_payroll(*f)
     vat = float(S("vat_pct"))
     if len(p):
-        g = p.groupby("Company").agg(Labour=("Code", "nunique"), Hours=("Hours", "sum"), Invoice=("Invoice", "sum"),
+        g = p.groupby("Company").agg(Labour=("Code", "nunique"), Hours=("Total Hrs", "sum"), Invoice=("Invoice", "sum"),
                                      Payroll=("Net", "sum")).reset_index()
         cost = q("""SELECT COALESCE(c.name,'-') AS Company, SUM(x.amount) AS Costs FROM costs x
             LEFT JOIN companies c ON c.id=x.company_id WHERE x.day BETWEEN ? AND ? GROUP BY 1""", (f[0], f[1]))
@@ -776,24 +872,24 @@ elif page == "Invoices":
         g["Invoice + VAT"] = g.Invoice + g.VAT
         g["Profit"] = g.Invoice - g.Payroll - g.Costs
         g = g.round(2)
-        st.dataframe(g, use_container_width=True, hide_index=True)
+        st.dataframe(add_total(g), use_container_width=True, hide_index=True)
         c = st.columns(3)
         c[0].metric("Invoice (ex VAT)", f"{g.Invoice.sum():,.2f} {cur_}")
         c[1].metric("Payroll + costs", f"{g.Payroll.sum() + g.Costs.sum():,.2f} {cur_}")
         c[2].metric("Profit / Loss", f"{g.Profit.sum():,.2f} {cur_}")
-        download(g, "company_profit")
+        download(g, "company_profit", hdr_of(*f[:7]))
         who = st.selectbox("Invoice detail for company", g.Company)
-        d = p[p.Company == who][["Name", "Section", "Hours", "Invoice"]].copy()
-        d["Rate/hr"] = (d.Invoice / d.Hours.where(d.Hours > 0)).round(2)
-        st.dataframe(d, use_container_width=True, hide_index=True)
-        download(d, "invoice_" + who.replace(" ", "_"))
+        d = p[p.Company == who][["Name", "Iqama ID", "Passport No", "Section", "Total Hrs", "Invoice"]].copy()
+        d["Rate/hr"] = (d.Invoice / d["Total Hrs"].where(d["Total Hrs"] > 0)).round(2)
+        st.dataframe(add_total(d), use_container_width=True, hide_index=True)
+        download(d, "invoice_" + who.replace(" ", "_"), hdr_of(*f[:7]))
     else:
         st.info("No attendance in this range.")
 
 # ---------------- Import
 elif page == "Import":
     st.header("Bulk import employees (Excel / CSV)")
-    T = ["Code", "Name", "Nationality", "ID No", "Phone", "Company", "Section", "Sponsor", "Labour Type", "Pay Type",
+    T = ["Code", "Name", "Nationality", "ID No", "Passport No", "Phone", "Company", "Section", "Sponsor", "Labour Type", "Pay Type",
          "Pay Mode", "Rate", "Food Allow", "OT Rate", "Bill Rate", "Join Date", "ID Expiry"]
     st.download_button("⬇ Download template", pd.DataFrame(columns=T).to_csv(index=False), "employee_template.csv")
     st.caption("Labour Type: Company / Outside. Pay Type: Monthly / Hourly. Pay Mode: Bank / Cash. "
@@ -819,7 +915,7 @@ elif page == "Import":
                 if not txt(r.get("Code")):
                     continue
                 save_emp(dict(code=txt(r.get("Code")), name=txt(r.get("Name")), nationality=txt(r.get("Nationality")),
-                              id_no=txt(r.get("ID No")), phone=txt(r.get("Phone")), company_id=idof("companies", r.get("Company")),
+                              id_no=txt(r.get("ID No")), passport_no=txt(r.get("Passport No")), phone=txt(r.get("Phone")), company_id=idof("companies", r.get("Company")),
                               dept_id=idof("departments", r.get("Section")), sponsor_id=idof("sponsors", r.get("Sponsor")),
                               labour_type=txt(r.get("Labour Type")) or "Company", pay_type=txt(r.get("Pay Type")) or "Monthly",
                               pay_mode=txt(r.get("Pay Mode")) or "Bank", rate=num(r.get("Rate")),
@@ -847,28 +943,23 @@ elif page == "Reports":
             out.append({g: k, "Com. Persons": c_.Code.nunique(), "Com. Cash": c_.Cash.sum(), "Com. Bank": c_.Bank.sum(),
                         "Com. Subtotal": c_.Net.sum(), "Out Persons": o_.Code.nunique(), "Out Cash": o_.Cash.sum(),
                         "Out Bank": o_.Bank.sum(), "Out Subtotal": o_.Net.sum(), "Total": x.Net.sum()})
-        t = pd.DataFrame(out)
-        if len(t):
-            tot = t.sum(numeric_only=True)
-            tot[g] = "TOTAL"
-            t = pd.concat([t, tot.to_frame().T], ignore_index=True)
-        return t
+        return pd.DataFrame(out)
 
+    J = """LEFT JOIN companies c ON c.id=a.company_id LEFT JOIN companies c0 ON c0.id=e.company_id
+        LEFT JOIN departments d ON d.id=a.dept_id LEFT JOIN departments d0 ON d0.id=e.dept_id
+        LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE a.day BETWEEN ? AND ?"""
     if kind == "Attendance detail":
-        df = q("""SELECT a.day, e.code, e.name, COALESCE(c.name,c0.name) AS company, COALESCE(d.name,d0.name) AS section,
-            s.name AS sponsor, e.labour_type, e.pay_type, a.status, a.hours, a.ot_hours
-            FROM attendance a JOIN employees e ON e.id=a.emp_id
-            LEFT JOIN companies c ON c.id=a.company_id LEFT JOIN companies c0 ON c0.id=e.company_id
-            LEFT JOIN departments d ON d.id=a.dept_id LEFT JOIN departments d0 ON d0.id=e.dept_id
-            LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE a.day BETWEEN ? AND ? ORDER BY a.day""", (d1, d2))
-        df = apply_f(df, *f[2:])
+        df = q("""SELECT a.day, e.code, e.name, COALESCE(e.id_no,'') AS iqama_id, COALESCE(e.passport_no,'') AS passport_no,
+            COALESCE(c.name,c0.name) AS company, COALESCE(d.name,d0.name) AS section, s.name AS sponsor, e.labour_type,
+            e.pay_type, a.status, COALESCE(a.hours,0) AS normal_hrs, COALESCE(a.ot_hours,0) AS ot_hrs,
+            COALESCE(a.hours,0)+COALESCE(a.ot_hours,0) AS total_hrs FROM attendance a JOIN employees e ON e.id=a.emp_id
+            """ + J + " ORDER BY a.day", (d1, d2))
+        df = sign(apply_f(df, *f[2:]))
     elif kind == "Attendance sheet (P/A/L)":
-        df = q("""SELECT e.code, e.name, COALESCE(c.name,c0.name,'-') AS company, COALESCE(d.name,d0.name,'-') AS section,
-            s.name AS sponsor, e.labour_type, e.pay_type, e.rate AS rate, e.ot_rate AS ot_rate, a.day, a.status, a.hours,
-            COALESCE(a.ot_hours,0) AS ot FROM attendance a JOIN employees e ON e.id=a.emp_id
-            LEFT JOIN companies c ON c.id=a.company_id LEFT JOIN companies c0 ON c0.id=e.company_id
-            LEFT JOIN departments d ON d.id=a.dept_id LEFT JOIN departments d0 ON d0.id=e.dept_id
-            LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE a.day BETWEEN ? AND ?""", (d1, d2))
+        df = q("""SELECT e.code, e.name, COALESCE(e.id_no,'') AS iqama_id, COALESCE(e.passport_no,'') AS passport_no,
+            COALESCE(c.name,c0.name,'-') AS company, COALESCE(d.name,d0.name,'-') AS section, s.name AS sponsor,
+            e.labour_type, e.pay_type, e.rate AS rate, e.ot_rate AS ot_rate, a.day, a.status, a.hours,
+            COALESCE(a.ot_hours,0) AS ot FROM attendance a JOIN employees e ON e.id=a.emp_id """ + J, (d1, d2))
         df = apply_f(df, *f[2:])
         if len(df):
             wk = pd.to_datetime(df.day).dt.weekday == int(S("weekend"))
@@ -877,42 +968,46 @@ elif page == "Reports":
             df["oh"] = df.ot.where(pre & ~wk, 0) + (hh + df.ot).where(pre & wk, 0)
             df["c"], df["d"] = df.status.map(CODE).fillna("?"), df.day.str[5:]
             rt = {x.code: ot_rate_of(x.rate, x.pay_type, x.ot_rate, d2) for x in df.drop_duplicates("code").itertuples()}
-            ix = ["code", "name", "company", "section"]
+            ix = ["code", "name", "iqama_id", "passport_no", "pay_type", "company", "section"]
             grid = df.pivot_table(index=ix, columns="d", values="c", aggfunc="first").fillna("")
             tot = df.groupby(ix).agg(P=("c", lambda x: (x == "P").sum()), A=("c", lambda x: (x == "A").sum()),
                                      L=("c", lambda x: (x == "L").sum()), Normal_Hrs=("nh", "sum"), OT_Hrs=("oh", "sum"))
+            tot["Total_Hrs"] = tot.Normal_Hrs + tot.OT_Hrs
             tot["OT_Rate"] = [rt[i[0]] for i in tot.index]
             tot["OT_Amount"] = (tot.OT_Hrs * tot.OT_Rate).round(2)
-            df = grid.join(tot).reset_index()
             if role == "Manager":
-                df = df.drop(columns=["OT_Rate", "OT_Amount"])
+                tot = tot.drop(columns=["OT_Rate", "OT_Amount"])
+            df = sign(grid.join(tot).reset_index())
     elif kind == "ID / Iqama expiry":
         e = apply_f(emp_df(), *f[2:])
         x = e.id_expiry.fillna("")
-        df = e[(x >= d1) & (x <= d2) & (x != "")][["code", "name", "company", "section", "sponsor", "id_no", "id_expiry"]]
-        df = df.sort_values("id_expiry")
+        df = e[(x >= d1) & (x <= d2) & (x != "")][["code", "name", "id_no", "passport_no", "company", "section", "sponsor",
+                                                    "id_expiry"]].rename(columns={"id_no": "iqama_id"}).sort_values("id_expiry")
+        df = sign(df)
     elif kind == "EOSB provision":
         out = []
         for _, r in apply_f(emp_df(), *f[2:]).iterrows():
             y, w, a_ = eosb(r, date.fromisoformat(d2))
-            out.append({"Code": r.code, "Name": r["name"], "Company": r.company, "Section": r.section,
-                        "Sponsor": r.sponsor, "Join date": r.join_date, "Years": y, "Monthly wage": w, "EOSB due": a_})
-        df = pd.DataFrame(out)
+            out.append({"Code": r.code, "Name": r["name"], "Iqama ID": r.id_no or "", "Passport No": r.passport_no or "",
+                        "Company": r.company, "Section": r.section, "Sponsor": r.sponsor, "Join date": r.join_date,
+                        "Years": y, "Monthly wage": w, "EOSB due": a_})
+        df = sign(pd.DataFrame(out))
     else:
         p = calc_payroll(*f)
         if kind == "Attendance summary":
-            df = p[["Code", "Name", "Company", "Section", "Sponsor", "Labour", "Days", "Leave", "Absent", "Hours", "OT Hrs", "Wknd Hrs"]]
+            df = sign(p[["Code", "Name", "Iqama ID", "Passport No", "Company", "Section", "Sponsor", "Labour", "Pay", "Days",
+                         "Leave", "Absent", "Normal Hrs", "OT Hrs", "Wknd Hrs", "Total Hrs"]])
         elif kind == "Payroll sheet":
-            df = p
+            df = view_pay(p)
         elif kind == "Hours (hourly basis)":
-            df = p[p.Pay == "Hourly"][["Code", "Name", "Company", "Section", "Sponsor", "Rate", "Hours", "OT Hrs", "Wknd Hrs", "Net"]]
+            df = sign(p[p.Pay == "Hourly"][["Code", "Name", "Iqama ID", "Passport No", "Company", "Section", "Sponsor",
+                                            "Hr Rate", "OT Rate", "Normal Hrs", "OT Hrs", "Wknd Hrs", "Total Hrs", "Net"]])
         elif kind == "Company x Kofil matrix":
-            df = p.pivot_table(index="Company", columns="Sponsor", values="Net", aggfunc="sum", fill_value=0,
-                               margins=True, margins_name="TOTAL").reset_index() if len(p) else p
+            df = p.pivot_table(index="Company", columns="Sponsor", values="Net", aggfunc="sum", fill_value=0).reset_index() if len(p) else p
         else:
             df = split(p, {"Company-wise": "Company", "Section-wise": "Section", "Kofil-wise": "Sponsor"}[kind])
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    download(df, kind.replace(" ", "_"))
+    st.dataframe(add_total(df), use_container_width=True, hide_index=True)
+    download(df, kind.replace(" ", "_").replace("(", "").replace(")", "").replace("/", ""), hdr_of(*f[:7]))
 
 # ---------------- Settings
 elif page == "Settings":
@@ -948,7 +1043,7 @@ CAN_DELETE = ("Admin",)         # roles that can delete (change here if you want
 
 
 def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used_in=(), cascade=(), key="m",
-           after_upd=None, before_del=None, guard=None, flt=None, cols=None):
+           after_upd=None, before_del=None, guard=None, flt=None, cols=None, post=None):
     """Inline Edit + Delete grid for any table. `sql` must return `id` plus the columns to show."""
     can_e, can_d = role in CAN_EDIT, role in CAN_DELETE
     if not (can_e or can_d):
@@ -957,6 +1052,8 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
         st.success(st.session_state.pop("flash"))
     fks, selects = fks or {}, selects or {}
     df = q(sql, params)
+    if post is not None and not df.empty:
+        df = post(df)
     fsig = ""
     if flt:   # Company / Section / Kofil / Labour / Pay type boxes with 'All' inside, same as the report pages
         cos, secs, spns = (q(f"SELECT name FROM {t}").name.tolist() for t in ("companies", "departments", "sponsors"))
@@ -998,6 +1095,11 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
     ver = st.session_state.get(key + "v", 0)
     ed = st.data_editor(view, hide_index=True, use_container_width=True, column_config=cfg,
                         disabled=[c for c in view.columns if c not in editable], key=f"{key}{ver}{sq_}{fsig}{all_del}")
+    _n = [c for c in ed.columns if c not in ("id", "emp_id", "Delete", "active") and pd.api.types.is_numeric_dtype(ed[c])
+          and not pd.api.types.is_bool_dtype(ed[c]) and "rate" not in c.lower()]
+    if _n:
+        st.dataframe(pd.DataFrame([{"TOTAL": f"{len(ed)} rows", **{c: round(float(ed[c].sum()), 2) for c in _n}}]),
+                     hide_index=True, use_container_width=True)
 
     def done(msg):
         st.session_state[key + "v"] = ver + 1
@@ -1084,6 +1186,12 @@ def lv_sync(o, r):  # after editing a leave: recalc days and rebuild its attenda
               fetch=False)
 
 
+def att_post(df):   # extra display columns for the attendance records grid
+    df["total_hrs"] = df.hours.fillna(0) + df.ot_hours.fillna(0)
+    df["ot_rate"] = [ot_rate_of(r["_rate"], r.pay_type, r["_otr"] or 0, r.day) for _, r in df.iterrows()]
+    return df.drop(columns=["_rate", "_otr"])
+
+
 if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Setup", "Attendance", "Leave", "Adjustments", "Costs", "Users"):
     st.divider()
     st.subheader("✏️ Edit / 🗑 Delete")
@@ -1096,9 +1204,9 @@ if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Setup", "Attendance"
     if page == "Employees":
         manage("employees", """SELECT e.id, e.code, e.name, c.name AS company, d.name AS section, s.name AS sponsor,
             e.labour_type, e.pay_type, e.pay_mode, e.rate, e.food_allow, e.ot_rate, e.bill_rate, e.nationality,
-            e.id_no, e.phone, e.join_date, e.id_expiry, e.active FROM employees e""" + EJ + "ORDER BY e.code",
+            e.id_no, e.passport_no, e.phone, e.join_date, e.id_expiry, e.active FROM employees e""" + EJ + "ORDER BY e.code",
                edit=["code", "name", "labour_type", "pay_type", "pay_mode", "rate", "food_allow", "ot_rate", "bill_rate",
-                     "nationality", "id_no", "phone", "join_date", "id_expiry", "active"],
+                     "nationality", "id_no", "passport_no", "phone", "join_date", "id_expiry", "active"],
                fks={"company": ("company_id", "companies"), "section": ("dept_id", "departments"),
                     "sponsor": ("sponsor_id", "sponsors")},
                selects={"labour_type": ["Company", "Outside"], "pay_type": ["Monthly", "Hourly"],
@@ -1121,13 +1229,14 @@ if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Setup", "Attendance"
     elif page == "Attendance":
         cc = st.columns(7)
         a1, a2 = dr("mat", cc[:2])
-        manage("attendance", """SELECT a.id, a.day, e.code, e.name AS employee, c.name AS company, d.name AS section,
-            s.name AS sponsor, e.labour_type, e.pay_type, a.status, a.hours, a.ot_hours FROM attendance a
+        manage("attendance", """SELECT a.id, a.day, e.code, e.name AS employee, COALESCE(e.id_no,'') AS iqama_id, COALESCE(e.passport_no,'') AS passport_no,
+            e.pay_type, c.name AS company, d.name AS section, s.name AS sponsor, e.labour_type, a.status, a.hours, a.ot_hours,
+            e.rate AS _rate, e.ot_rate AS _otr FROM attendance a
             JOIN employees e ON e.id=a.emp_id LEFT JOIN companies c ON c.id=COALESCE(a.company_id,e.company_id)
             LEFT JOIN departments d ON d.id=COALESCE(a.dept_id,e.dept_id) LEFT JOIN sponsors s ON s.id=e.sponsor_id
             WHERE a.day BETWEEN ? AND ? ORDER BY a.day DESC, e.code""", (a1, a2),
                edit=["status", "hours", "ot_hours"], selects={"status": ["Present", "Absent", "Leave", "Off"]},
-               key="att", flt="xatt", cols=cc[2:])
+               key="att", flt="xatt", cols=cc[2:], post=att_post)
 
     elif page == "Leave":
         cc = st.columns(7)
