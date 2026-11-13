@@ -1,7 +1,7 @@
 """International HRM - Streamlit + SQLite
 Run: pip install streamlit pandas && streamlit run hrm_app.py
 """
-import sqlite3, hashlib, io, html, calendar
+import sqlite3, hashlib, io, html, calendar, hmac
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, available_timezones
 import pandas as pd
@@ -553,7 +553,7 @@ if "user" not in st.session_state:
             u = st.text_input("Username", placeholder="👤  your username")
             p_ = st.text_input("Password", type="password", placeholder="🔒  your password")
             if st.form_submit_button("Sign in", use_container_width=True):
-                r_ = q("SELECT * FROM users WHERE username=? AND pw=?", (u.strip(), pw(p_)))
+                r_ = q("SELECT * FROM users WHERE lower(username)=lower(?) AND pw=?", (u.strip(), pw(p_)))
                 if len(r_):
                     st.session_state.user, st.session_state.role = r_.username[0], r_.role[0]
                     st.rerun()
@@ -563,6 +563,26 @@ if "user" not in st.session_state:
             st.caption("First login: admin / admin123 - change it in Users after signing in.")
         else:
             st.caption("Forgot your password? Ask your administrator to reset it.")
+        with st.expander("Forgot username / password?"):
+            try:
+                rk = str(st.secrets.get("RECOVERY_KEY", ""))
+            except Exception:
+                rk = ""
+            key_ = st.text_input("Recovery key", type="password", key="rk")
+            if not rk:
+                st.info('Recovery is not set up yet. In Streamlit: Manage app > Settings > Secrets, add  '
+                        'RECOVERY_KEY = "your-long-secret"  and Save.')
+            elif key_ and hmac.compare_digest(key_, rk):
+                st.dataframe(q("SELECT username, role FROM users ORDER BY username"), hide_index=True)
+                nu = st.text_input("Username (existing = reset password, new = create)", key="rku")
+                npw = st.text_input("New password", type="password", key="rkp")
+                nr = st.selectbox("Role", ["Admin", "HR", "Manager"], key="rkr")
+                if st.button("Save login", key="rks") and nu.strip() and npw:
+                    q("INSERT INTO users(username,pw,role) VALUES(?,?,?) ON CONFLICT(username) "
+                      "DO UPDATE SET pw=excluded.pw, role=excluded.role", (nu.strip(), pw(npw), nr), fetch=False)
+                    st.success("Saved. Now sign in with this username and password.")
+            elif key_:
+                st.error("Wrong recovery key")
     st.stop()
 role = st.session_state.role
 ALL = ["Dashboard", "Employees", "Transfer", "Setup", "Attendance", "Leave", "Adjustments", "Costs", "Payroll",
