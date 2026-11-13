@@ -123,6 +123,9 @@ def do_transfer(r, co, dp, sp, day, note, upd):
     nn = lambda v: None if pd.isna(v) else int(v)
     cur = (nn(r.company_id), nn(r.dept_id), nn(r.sponsor_id))
     new = (co if co is not None else cur[0], dp if dp is not None else cur[1], sp if sp is not None else cur[2])
+    # freeze the OLD place on every earlier attendance row that has no place saved, so history never follows the employee
+    q("UPDATE attendance SET company_id=COALESCE(company_id,?), dept_id=COALESCE(dept_id,?), sponsor_id=COALESCE(sponsor_id,?) "
+      "WHERE emp_id=?", (*cur, int(r.id)), fetch=False)
     q("INSERT INTO transfers(emp_id,day,from_company,from_dept,from_sponsor,to_company,to_dept,to_sponsor,note) "
       "VALUES(?,?,?,?,?,?,?,?,?)", (int(r.id), str(day), *cur, *new, note), fetch=False)
     q("UPDATE employees SET company_id=?, dept_id=?, sponsor_id=? WHERE id=?", (*new, int(r.id)), fetch=False)
