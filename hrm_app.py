@@ -205,7 +205,7 @@ def init():
         from_sponsor INT, to_company INT, to_dept INT, to_sponsor INT, note TEXT)""", fetch=False)
     for t_, c_ in [("employees", "id_expiry TEXT"), ("employees", "company_id INT"), ("employees", "food_allow REAL DEFAULT 0"),
                    ("employees", "ot_rate REAL DEFAULT 0"), ("employees", "bill_rate REAL DEFAULT 0"),
-                   ("employees", "pay_mode TEXT DEFAULT 'Bank'"), ("attendance", "company_id INT"), ("attendance", "dept_id INT"), ("attendance", "ot_hours REAL"), ("employees", "passport_no TEXT"), ("attendance", "sponsor_id INT")]:
+                   ("employees", "pay_mode TEXT DEFAULT 'Bank'"), ("attendance", "company_id INT"), ("attendance", "dept_id INT"), ("attendance", "ot_hours REAL"), ("employees", "passport_no TEXT"), ("attendance", "sponsor_id INT"), ("companies", "cycle_day INT DEFAULT 1")]:
         try:
             q(f"ALTER TABLE {t_} ADD COLUMN {c_}", fetch=False)
         except Exception:
@@ -279,6 +279,68 @@ def dbox(col, label, value, key):
     with col:
         st.markdown('<span class="cb cb-dt"></span>', unsafe_allow_html=True)
         return st.date_input(label, value, key=key)
+
+
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+          "November", "December"]
+
+
+def cycle_range(y, m, cday):
+    """Pay period of the month named by its START: day 21 of November -> 20 December."""
+    start = date(y, m, min(max(int(cday or 1), 1), 28))
+    ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+    return start, date(ny, nm, start.day) - timedelta(days=1)
+
+
+def pay_groups(y, m, co):
+    """[(start, end, [companies])] - companies with the same pay cycle share one period."""
+    cm = q("SELECT name, COALESCE(cycle_day,1) AS cd FROM companies")
+    cd = dict(zip(cm.name, cm.cd))
+    groups = {}
+    for n in (co or cm.name.tolist()):
+        groups.setdefault(cycle_range(y, m, cd.get(n, 1)), []).append(n)
+    if not co:   # staff with no company assigned yet
+        groups.setdefault(cycle_range(y, m, 1), []).append("-")
+    return [(str(a), str(b), v) for (a, b), v in sorted(groups.items())]
+
+
+def dsel(col, label, options, index, key):
+    with col:
+        st.markdown('<span class="cb cb-dt"></span>', unsafe_allow_html=True)
+        return st.selectbox(label, options, index=index, key=key)
+
+
+def pay_filters(key):
+    """Company, Sponsor/Kofil, ... then 'For the month of' (or custom dates). The pay period of every selected
+    company is filled in from its cycle start day; results are shown group by group."""
+    cos, secs, spns = (q(f"SELECT name FROM {t}").name.tolist() for t in ("companies", "departments", "sponsors"))
+    c = st.columns(5)
+    with c[0]:
+        co = eff(msel("Company", cos, key + "_co"), cos)
+    with c[1]:
+        spn = eff(msel("Sponsor / Kofil", spns, key + "_spn"), spns)
+    with c[2]:
+        sec = eff(msel("Section", secs, key + "_sec"), secs)
+    with c[3]:
+        lt = eff(msel("Labour", ["Company", "Outside"], key + "_lab"), ["Company", "Outside"])
+    with c[4]:
+        pt = eff(msel("Pay type", ["Monthly", "Hourly"], key + "_pay"), ["Monthly", "Hourly"])
+    td = today()
+    c = st.columns([1, 0.8, 1.1, 1, 1])
+    mo = dsel(c[0], "For the month of", MONTHS, td.month - 1, key + "_mo")
+    yr = dsel(c[1], "Year", list(range(2024, 2031)), min(max(td.year - 2024, 0), 6), key + "_yr")
+    custom = c[2].checkbox("Use custom dates", key=key + "_cu")
+    if custom:
+        d1, d2 = dbox(c[3], "From", td.replace(day=1), key + "a"), dbox(c[4], "To", td, key + "b")
+        groups = [(str(d1), str(d2), co)]
+    else:
+        groups = pay_groups(yr, MONTHS.index(mo) + 1, co)
+        fm = lambda x: date.fromisoformat(x).strftime("%d %b %Y")
+        st.info(f"For the month of **{mo.upper()}-{yr}**   |   Period:  " +
+                "   ||   ".join(f"**{', '.join(v)}**: {fm(a)} to {fm(b)}" for a, b, v in groups))
+    qs = st.text_input("🔎 Search code / name", key=key + "h")
+    st.session_state["_grp_" + key], st.session_state["_cyc_" + key] = groups, not custom
+    return min(g[0] for g in groups), max(g[1] for g in groups), sec, lt, pt, spn, co, qs
 
 
 def filters(key):
@@ -380,14 +442,14 @@ def df_pdf(df, title, hdr=""):
     return b.getvalue()
 
 
-def download(df, name, hdr=""):
+def download(df, name, hdr="", uid=""):
     df = add_total(df)
     c = st.columns([1, 1, 6])
     c[0].download_button("⬇ CSV", df.to_csv(index=False).encode("utf-8-sig"), f"{name}_{today()}.csv", "text/csv",
-                         key="csv_" + name)
+                         key="csv_" + name + uid)
     try:
         c[1].download_button("⬇ PDF (print)", df_pdf(df, name.replace("_", " "), hdr), f"{name}_{today()}.pdf",
-                             "application/pdf", key="pdf_" + name)
+                             "application/pdf", key="pdf_" + name + uid)
     except ImportError:
         c[1].caption("pip install reportlab")
 
@@ -412,7 +474,7 @@ def view_pay(p):
     return sign(d)
 
 
-def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
+def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs="", cyc=False):
     """Monthly staff: Basic and Food = amount / working days of the month (days - Fridays) x working days of the period;
     every working day that is Absent, Off or left unmarked (between the first and last marked day of the month) is shown
     in 'Absent Ded'. Weekend work = OT only. One day's basic as Bonus for a full working month (all places together).
@@ -425,6 +487,13 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
     std, otm, we = float(S("std_hours")), float(S("ot_mult")), int(S("weekend"))
     gp, gn = float(S("gosi_pct")), S("gosi_nat").strip().lower()
     D1, D2 = date.fromisoformat(d1), date.fromisoformat(d2)
+
+    def _bounds(mth):   # (first day, last day, working days) of the calendar month - or of the whole pay period if cyc
+        if cyc:
+            return D1, D2, sum((D1 + timedelta(k)).weekday() != we for k in range((D2 - D1).days + 1))
+        y_, m_ = int(mth[:4]), int(mth[5:])
+        return date(y_, m_, 1), date(y_, m_, calendar.monthrange(y_, m_)[1]), _wd(y_, m_, we)
+
     rows = []
     for _, r in e.iterrows():
         a = att[att.emp_id == r.id].copy()
@@ -432,21 +501,20 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
             continue
         a["cid"], a["sid"], a["kid"] = a.company_id.fillna(r.company_id), a.dept_id.fillna(r.dept_id), a.sponsor_id.fillna(r.sponsor_id)
         a["ot_hours"], a["hours"] = a.ot_hours.fillna(0), a.hours.fillna(0)
-        a["m"], a["wk"] = a.day.str[:7], pd.to_datetime(a.day).dt.weekday == we
+        a["m"], a["wk"] = ("P" if cyc else a.day.str[:7]), pd.to_datetime(a.day).dt.weekday == we
         ad = adj[adj.emp_id == r.id]
         monthly = r.pay_type == "Monthly"
         full, gap, gap_used = set(), {}, set()
         if monthly:
             for mth in a.m.unique():
-                y_, m_ = int(mth[:4]), int(mth[5:])
+                lo, hi, wdm0 = _bounds(mth)
                 mr = a[a.m == mth]
                 da, db = date.fromisoformat(mr.day.min()), date.fromisoformat(mr.day.max())
                 span = sum((da + timedelta(k)).weekday() != we for k in range((db - da).days + 1))
                 nw = mr[~mr.wk]
                 gap[mth] = max(span - len(nw[nw.status.isin(["Present", "Leave", "Absent"])]), 0)
-                if date(y_, m_, 1) >= D1 and date(y_, m_, calendar.monthrange(y_, m_)[1]) <= D2:
-                    if len(nw[nw.status == "Present"]) >= _wd(y_, m_, we):
-                        full.add(mth)
+                if lo >= D1 and hi <= D2 and len(nw[nw.status == "Present"]) >= wdm0:
+                    full.add(mth)
         first = True
         for (cid, sid, kid), g in a.groupby(["cid", "sid", "kid"], dropna=False):
             pres = g[g.status == "Present"]
@@ -457,8 +525,7 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
             if monthly:
                 days_ab = 0
                 for mth, gm in g.groupby("m"):
-                    y_, m_ = int(mth[:4]), int(mth[5:])
-                    wdm = _wd(y_, m_, we)
+                    wdm = _bounds(mth)[2]
                     otr = r.ot_rate if r.ot_rate > 0 else r.rate / wdm / std * otm
                     p_, w_ = gm[(gm.status == "Present") & ~gm.wk], gm[(gm.status == "Present") & gm.wk]
                     paid = len(p_) + len(gm[(gm.status == "Leave") & ~gm.wk])
@@ -794,9 +861,10 @@ elif page == "Setup":
     with c1:
         st.subheader("Client companies")
         n, v = st.text_input("Company name"), st.text_input("VAT / Tax no")
+        cdy = st.number_input("Pay cycle start day (1 = whole month, 21 = 21st to 20th)", 1, 28, 1)
         if st.button("Add company") and n:
-            q("INSERT OR IGNORE INTO companies(name,vat) VALUES(?,?)", (n, v), fetch=False); st.rerun()
-        st.dataframe(q("SELECT name, vat FROM companies"), hide_index=True)
+            q("INSERT OR IGNORE INTO companies(name,vat,cycle_day) VALUES(?,?,?)", (n, v, int(cdy)), fetch=False); st.rerun()
+        st.dataframe(q("SELECT name, vat, cycle_day FROM companies"), hide_index=True)
     with c2:
         st.subheader("Sections")
         n = st.text_input("New section")
@@ -986,23 +1054,30 @@ elif page == "Users":
 # ---------------- Payroll
 elif page == "Payroll":
     st.header("Payroll")
-    f = filters("pay")
-    raw = calc_payroll(*f)
-    df = view_pay(raw)
-    st.dataframe(add_total(df), use_container_width=True, hide_index=True)
-    if len(df):
+    f = pay_filters("pay")
+    shown = False
+    for gi, (a, b, cs) in enumerate(st.session_state["_grp_pay"]):
+        raw = calc_payroll(a, b, f[2], f[3], f[4], f[5], cs, f[7], st.session_state["_cyc_pay"])
+        if raw.empty:
+            continue
+        shown = True
+        df = view_pay(raw)
+        st.subheader(f"Period {a} to {b}  -  {', '.join(cs) if cs else 'All companies'}")
+        st.dataframe(add_total(df), use_container_width=True, hide_index=True)
         c = st.columns(3)
         c[0].metric("Total Net", f"{raw.Net.sum():,.2f} {cur_}")
         c[1].metric("Company labour", f"{raw[raw.Labour == 'Company'].Net.sum():,.2f} {cur_}")
         c[2].metric("Outside labour", f"{raw[raw.Labour == 'Outside'].Net.sum():,.2f} {cur_}")
-        download(df, "payroll", hdr_of(*f[:7]))
-        sel = st.selectbox("Payslip for", raw.Code + " - " + raw.Name)
+        download(df, "payroll", hdr_of(a, b, f[2], f[3], f[4], f[5], cs), str(gi))
+        sel = st.selectbox("Payslip for", raw.Code + " - " + raw.Name, key=f"pslip{gi}")
         try:
             row = raw[raw.Code == sel.split(" - ")[0]].iloc[0]
-            st.download_button("🧾 Download payslip PDF", payslip_pdf(row, f[0], f[1]),
-                               f"payslip_{row.Code}_{f[0]}_{f[1]}.pdf", "application/pdf")
+            st.download_button("🧾 Download payslip PDF", payslip_pdf(row, a, b), f"payslip_{row.Code}_{a}_{b}.pdf",
+                               "application/pdf", key=f"psl_btn{gi}")
         except ImportError:
             st.info("For payslip PDF run: pip install reportlab")
+    if not shown:
+        st.info("No attendance in this period.")
 
 # ---------------- Costs
 elif page == "Costs":
@@ -1037,14 +1112,18 @@ elif page == "Costs":
 # ---------------- Invoices
 elif page == "Invoices":
     st.header("Client invoices & company-wise profit")
-    f = filters("inv")
-    p = calc_payroll(*f)
-    vat = float(S("vat_pct"))
-    if len(p):
+    f = pay_filters("inv")
+    vat, shown = float(S("vat_pct")), False
+    for gi, (a, b, cs) in enumerate(st.session_state["_grp_inv"]):
+        p = calc_payroll(a, b, f[2], f[3], f[4], f[5], cs, f[7], st.session_state["_cyc_inv"])
+        if p.empty:
+            continue
+        shown = True
+        st.subheader(f"Period {a} to {b}  -  {', '.join(cs) if cs else 'All companies'}")
         g = p.groupby("Company").agg(Labour=("Code", "nunique"), Hours=("Total Hrs", "sum"), Invoice=("Invoice", "sum"),
                                      Payroll=("Net", "sum")).reset_index()
         cost = q("""SELECT COALESCE(c.name,'-') AS Company, SUM(x.amount) AS Costs FROM costs x
-            LEFT JOIN companies c ON c.id=x.company_id WHERE x.day BETWEEN ? AND ? GROUP BY 1""", (f[0], f[1]))
+            LEFT JOIN companies c ON c.id=x.company_id WHERE x.day BETWEEN ? AND ? GROUP BY 1""", (a, b))
         g = g.merge(cost, how="left", on="Company").fillna({"Costs": 0})
         g["VAT"] = g.Invoice * vat / 100
         g["Invoice + VAT"] = g.Invoice + g.VAT
@@ -1055,14 +1134,14 @@ elif page == "Invoices":
         c[0].metric("Invoice (ex VAT)", f"{g.Invoice.sum():,.2f} {cur_}")
         c[1].metric("Payroll + costs", f"{g.Payroll.sum() + g.Costs.sum():,.2f} {cur_}")
         c[2].metric("Profit / Loss", f"{g.Profit.sum():,.2f} {cur_}")
-        download(g, "company_profit", hdr_of(*f[:7]))
-        who = st.selectbox("Invoice detail for company", g.Company)
+        download(g, "company_profit", hdr_of(a, b, f[2], f[3], f[4], f[5], cs), str(gi))
+        who = st.selectbox("Invoice detail for company", g.Company, key=f"inv_w{gi}")
         d = p[p.Company == who][["Name", "Iqama ID", "Passport No", "Section", "Total Hrs", "Invoice"]].copy()
         d["Rate/hr"] = (d.Invoice / d["Total Hrs"].where(d["Total Hrs"] > 0)).round(2)
         st.dataframe(add_total(d), use_container_width=True, hide_index=True)
-        download(d, "invoice_" + who.replace(" ", "_"), hdr_of(*f[:7]))
-    else:
-        st.info("No attendance in this range.")
+        download(d, "invoice_" + who.replace(" ", "_"), hdr_of(a, b, f[2], f[3], f[4], f[5], cs), str(gi))
+    if not shown:
+        st.info("No attendance in this period.")
 
 # ---------------- Import
 elif page == "Import":
@@ -1105,98 +1184,113 @@ elif page == "Import":
 
 # ---------------- Reports
 elif page == "Reports":
-    st.header("Reports (custom date range)")
+    st.header("Reports ")
     kinds = ["Attendance detail", "Attendance summary", "Attendance sheet (P/A/L)", "Work history (where worked)"]
     if role != "Manager":
         kinds += ["Payroll sheet", "Company-wise", "Section-wise", "Kofil-wise", "Company x Kofil matrix",
                   "Hours (hourly basis)", "Transfer history", "ID / Iqama expiry", "EOSB provision"]
     kind = st.selectbox("Report", kinds)
-    f = filters("rep")
-    d1, d2 = f[0], f[1]
+    f = pay_filters("rep")
+    cyc_ = st.session_state["_cyc_rep"]
 
-    def split(p, g):
-        out = []
-        for k, x in p.groupby(g):
-            c_, o_ = x[x.Labour == "Company"], x[x.Labour == "Outside"]
-            out.append({g: k, "Com. Persons": c_.Code.nunique(), "Com. Cash": c_.Cash.sum(), "Com. Bank": c_.Bank.sum(),
-                        "Com. Subtotal": c_.Net.sum(), "Out Persons": o_.Code.nunique(), "Out Cash": o_.Cash.sum(),
-                        "Out Bank": o_.Bank.sum(), "Out Subtotal": o_.Net.sum(), "Total": x.Net.sum()})
-        return pd.DataFrame(out)
+    def report_df(kind, f):
+        d1, d2 = f[0], f[1]
 
-    J = """LEFT JOIN companies c ON c.id=a.company_id LEFT JOIN companies c0 ON c0.id=e.company_id
-        LEFT JOIN departments d ON d.id=a.dept_id LEFT JOIN departments d0 ON d0.id=e.dept_id
-        LEFT JOIN sponsors s ON s.id=COALESCE(a.sponsor_id,e.sponsor_id) WHERE a.day BETWEEN ? AND ?"""
-    if kind == "Attendance detail":
-        df = q("""SELECT a.day, e.code, e.name, COALESCE(e.id_no,'') AS iqama_id, COALESCE(e.passport_no,'') AS passport_no,
-            COALESCE(c.name,c0.name) AS company, COALESCE(d.name,d0.name) AS section, s.name AS sponsor, e.labour_type,
-            e.pay_type, a.status, COALESCE(a.hours,0) AS normal_hrs, COALESCE(a.ot_hours,0) AS ot_hrs,
-            COALESCE(a.hours,0)+COALESCE(a.ot_hours,0) AS total_hrs FROM attendance a JOIN employees e ON e.id=a.emp_id
-            """ + J + " ORDER BY a.day", (d1, d2))
-        df = sign(apply_f(df, *f[2:]))
-    elif kind == "Attendance sheet (P/A/L)":
-        df = q("""SELECT e.code, e.name, COALESCE(e.id_no,'') AS iqama_id, COALESCE(e.passport_no,'') AS passport_no,
-            COALESCE(c.name,c0.name,'-') AS company, COALESCE(d.name,d0.name,'-') AS section, s.name AS sponsor,
-            e.labour_type, e.pay_type, e.rate AS rate, e.ot_rate AS ot_rate, a.day, a.status, a.hours,
-            COALESCE(a.ot_hours,0) AS ot FROM attendance a JOIN employees e ON e.id=a.emp_id """ + J, (d1, d2))
-        df = apply_f(df, *f[2:])
-        if len(df):
-            wk = pd.to_datetime(df.day).dt.weekday == int(S("weekend"))
-            pre, hh = df.status == "Present", df.hours.fillna(0)
-            df["nh"] = hh.where(pre & ~wk, 0)
-            df["oh"] = df.ot.where(pre & ~wk, 0) + (hh + df.ot).where(pre & wk, 0)
-            df["c"], df["d"] = df.status.map(CODE).fillna("?"), df.day.str[5:]
-            rt = {x.code: ot_rate_of(x.rate, x.pay_type, x.ot_rate, d2) for x in df.drop_duplicates("code").itertuples()}
-            ix = ["code", "name", "iqama_id", "passport_no", "pay_type", "company", "section"]
-            grid = df.pivot_table(index=ix, columns="d", values="c", aggfunc="first").fillna("")
-            tot = df.groupby(ix).agg(P=("c", lambda x: (x == "P").sum()), A=("c", lambda x: (x == "A").sum()),
-                                     L=("c", lambda x: (x == "L").sum()), Normal_Hrs=("nh", "sum"), OT_Hrs=("oh", "sum"))
-            tot["Total_Hrs"] = tot.Normal_Hrs + tot.OT_Hrs
-            tot["OT_Rate"] = [rt[i[0]] for i in tot.index]
-            tot["OT_Amount"] = (tot.OT_Hrs * tot.OT_Rate).round(2)
-            if role == "Manager":
-                tot = tot.drop(columns=["OT_Rate", "OT_Amount"])
-            df = sign(grid.join(tot).reset_index())
-    elif kind == "Work history (where worked)":
-        df = q("""SELECT e.code, e.name, COALESCE(e.id_no,'') AS iqama_id, COALESCE(e.passport_no,'') AS passport_no,
-            COALESCE(c.name,c0.name,'-') AS company, COALESCE(d.name,d0.name,'-') AS section, COALESCE(s.name,'-') AS sponsor,
-            e.labour_type, e.pay_type, MIN(a.day) AS from_day, MAX(a.day) AS to_day, SUM(a.status='Present') AS days_present,
-            SUM(a.status='Leave') AS days_leave, SUM(a.status='Absent') AS days_absent,
-            ROUND(SUM(COALESCE(a.hours,0)),2) AS normal_hrs, ROUND(SUM(COALESCE(a.ot_hours,0)),2) AS ot_hrs
-            FROM attendance a JOIN employees e ON e.id=a.emp_id """ + J + " GROUP BY e.id, 5, 6, 7 ORDER BY e.code, from_day", (d1, d2))
-        df = apply_f(df, *f[2:])
-        df["total_hrs"] = df.normal_hrs + df.ot_hrs
-    elif kind == "Transfer history":
-        df = trf_df(d1, d2, f[2:]).drop(columns=["id"])
-    elif kind == "ID / Iqama expiry":
-        e = apply_f(emp_df(), *f[2:])
-        x = e.id_expiry.fillna("")
-        df = e[(x >= d1) & (x <= d2) & (x != "")][["code", "name", "id_no", "passport_no", "company", "section", "sponsor",
-                                                    "id_expiry"]].rename(columns={"id_no": "iqama_id"}).sort_values("id_expiry")
-        df = sign(df)
-    elif kind == "EOSB provision":
-        out = []
-        for _, r in apply_f(emp_df(), *f[2:]).iterrows():
-            y, w, a_ = eosb(r, date.fromisoformat(d2))
-            out.append({"Code": r.code, "Name": r["name"], "Iqama ID": r.id_no or "", "Passport No": r.passport_no or "",
-                        "Company": r.company, "Section": r.section, "Sponsor": r.sponsor, "Join date": r.join_date,
-                        "Years": y, "Monthly wage": w, "EOSB due": a_})
-        df = sign(pd.DataFrame(out))
-    else:
-        p = calc_payroll(*f)
-        if kind == "Attendance summary":
-            df = sign(p[["Code", "Name", "Iqama ID", "Passport No", "Company", "Section", "Sponsor", "Labour", "Pay", "Days",
-                         "Leave", "Absent", "Normal Hrs", "OT Hrs", "Wknd Hrs", "Total Hrs"]])
-        elif kind == "Payroll sheet":
-            df = view_pay(p)
-        elif kind == "Hours (hourly basis)":
-            df = sign(p[p.Pay == "Hourly"][["Code", "Name", "Iqama ID", "Passport No", "Company", "Section", "Sponsor",
-                                            "Hr Rate", "OT Rate", "Normal Hrs", "OT Hrs", "Wknd Hrs", "Total Hrs", "Net"]])
-        elif kind == "Company x Kofil matrix":
-            df = p.pivot_table(index="Company", columns="Sponsor", values="Net", aggfunc="sum", fill_value=0).reset_index() if len(p) else p
+        def split(p, g):
+            out = []
+            for k, x in p.groupby(g):
+                c_, o_ = x[x.Labour == "Company"], x[x.Labour == "Outside"]
+                out.append({g: k, "Com. Persons": c_.Code.nunique(), "Com. Cash": c_.Cash.sum(), "Com. Bank": c_.Bank.sum(),
+                            "Com. Subtotal": c_.Net.sum(), "Out Persons": o_.Code.nunique(), "Out Cash": o_.Cash.sum(),
+                            "Out Bank": o_.Bank.sum(), "Out Subtotal": o_.Net.sum(), "Total": x.Net.sum()})
+            return pd.DataFrame(out)
+
+        J = """LEFT JOIN companies c ON c.id=a.company_id LEFT JOIN companies c0 ON c0.id=e.company_id
+            LEFT JOIN departments d ON d.id=a.dept_id LEFT JOIN departments d0 ON d0.id=e.dept_id
+            LEFT JOIN sponsors s ON s.id=COALESCE(a.sponsor_id,e.sponsor_id) WHERE a.day BETWEEN ? AND ?"""
+        if kind == "Attendance detail":
+            df = q("""SELECT a.day, e.code, e.name, COALESCE(e.id_no,'') AS iqama_id, COALESCE(e.passport_no,'') AS passport_no,
+                COALESCE(c.name,c0.name) AS company, COALESCE(d.name,d0.name) AS section, s.name AS sponsor, e.labour_type,
+                e.pay_type, a.status, COALESCE(a.hours,0) AS normal_hrs, COALESCE(a.ot_hours,0) AS ot_hrs,
+                COALESCE(a.hours,0)+COALESCE(a.ot_hours,0) AS total_hrs FROM attendance a JOIN employees e ON e.id=a.emp_id
+                """ + J + " ORDER BY a.day", (d1, d2))
+            df = sign(apply_f(df, *f[2:]))
+        elif kind == "Attendance sheet (P/A/L)":
+            df = q("""SELECT e.code, e.name, COALESCE(e.id_no,'') AS iqama_id, COALESCE(e.passport_no,'') AS passport_no,
+                COALESCE(c.name,c0.name,'-') AS company, COALESCE(d.name,d0.name,'-') AS section, s.name AS sponsor,
+                e.labour_type, e.pay_type, e.rate AS rate, e.ot_rate AS ot_rate, a.day, a.status, a.hours,
+                COALESCE(a.ot_hours,0) AS ot FROM attendance a JOIN employees e ON e.id=a.emp_id """ + J, (d1, d2))
+            df = apply_f(df, *f[2:])
+            if len(df):
+                wk = pd.to_datetime(df.day).dt.weekday == int(S("weekend"))
+                pre, hh = df.status == "Present", df.hours.fillna(0)
+                df["nh"] = hh.where(pre & ~wk, 0)
+                df["oh"] = df.ot.where(pre & ~wk, 0) + (hh + df.ot).where(pre & wk, 0)
+                df["c"], df["d"] = df.status.map(CODE).fillna("?"), df.day.str[5:]
+                rt = {x.code: ot_rate_of(x.rate, x.pay_type, x.ot_rate, d2) for x in df.drop_duplicates("code").itertuples()}
+                ix = ["code", "name", "iqama_id", "passport_no", "pay_type", "company", "section"]
+                grid = df.pivot_table(index=ix, columns="d", values="c", aggfunc="first").fillna("")
+                tot = df.groupby(ix).agg(P=("c", lambda x: (x == "P").sum()), A=("c", lambda x: (x == "A").sum()),
+                                         L=("c", lambda x: (x == "L").sum()), Normal_Hrs=("nh", "sum"), OT_Hrs=("oh", "sum"))
+                tot["Total_Hrs"] = tot.Normal_Hrs + tot.OT_Hrs
+                tot["OT_Rate"] = [rt[i[0]] for i in tot.index]
+                tot["OT_Amount"] = (tot.OT_Hrs * tot.OT_Rate).round(2)
+                if role == "Manager":
+                    tot = tot.drop(columns=["OT_Rate", "OT_Amount"])
+                df = sign(grid.join(tot).reset_index())
+        elif kind == "Work history (where worked)":
+            df = q("""SELECT e.code, e.name, COALESCE(e.id_no,'') AS iqama_id, COALESCE(e.passport_no,'') AS passport_no,
+                COALESCE(c.name,c0.name,'-') AS company, COALESCE(d.name,d0.name,'-') AS section, COALESCE(s.name,'-') AS sponsor,
+                e.labour_type, e.pay_type, MIN(a.day) AS from_day, MAX(a.day) AS to_day, SUM(a.status='Present') AS days_present,
+                SUM(a.status='Leave') AS days_leave, SUM(a.status='Absent') AS days_absent,
+                ROUND(SUM(COALESCE(a.hours,0)),2) AS normal_hrs, ROUND(SUM(COALESCE(a.ot_hours,0)),2) AS ot_hrs
+                FROM attendance a JOIN employees e ON e.id=a.emp_id """ + J + " GROUP BY e.id, 5, 6, 7 ORDER BY e.code, from_day", (d1, d2))
+            df = apply_f(df, *f[2:])
+            df["total_hrs"] = df.normal_hrs + df.ot_hrs
+        elif kind == "Transfer history":
+            df = trf_df(d1, d2, f[2:]).drop(columns=["id"])
+        elif kind == "ID / Iqama expiry":
+            e = apply_f(emp_df(), *f[2:])
+            x = e.id_expiry.fillna("")
+            df = e[(x >= d1) & (x <= d2) & (x != "")][["code", "name", "id_no", "passport_no", "company", "section", "sponsor",
+                                                        "id_expiry"]].rename(columns={"id_no": "iqama_id"}).sort_values("id_expiry")
+            df = sign(df)
+        elif kind == "EOSB provision":
+            out = []
+            for _, r in apply_f(emp_df(), *f[2:]).iterrows():
+                y, w, a_ = eosb(r, date.fromisoformat(d2))
+                out.append({"Code": r.code, "Name": r["name"], "Iqama ID": r.id_no or "", "Passport No": r.passport_no or "",
+                            "Company": r.company, "Section": r.section, "Sponsor": r.sponsor, "Join date": r.join_date,
+                            "Years": y, "Monthly wage": w, "EOSB due": a_})
+            df = sign(pd.DataFrame(out))
         else:
-            df = split(p, {"Company-wise": "Company", "Section-wise": "Section", "Kofil-wise": "Sponsor"}[kind])
-    st.dataframe(add_total(df), use_container_width=True, hide_index=True)
-    download(df, kind.replace(" ", "_").replace("(", "").replace(")", "").replace("/", ""), hdr_of(*f[:7]))
+            p = calc_payroll(*f, cyc=cyc_)
+            if kind == "Attendance summary":
+                df = sign(p[["Code", "Name", "Iqama ID", "Passport No", "Company", "Section", "Sponsor", "Labour", "Pay", "Days",
+                             "Leave", "Absent", "Normal Hrs", "OT Hrs", "Wknd Hrs", "Total Hrs"]])
+            elif kind == "Payroll sheet":
+                df = view_pay(p)
+            elif kind == "Hours (hourly basis)":
+                df = sign(p[p.Pay == "Hourly"][["Code", "Name", "Iqama ID", "Passport No", "Company", "Section", "Sponsor",
+                                                "Hr Rate", "OT Rate", "Normal Hrs", "OT Hrs", "Wknd Hrs", "Total Hrs", "Net"]])
+            elif kind == "Company x Kofil matrix":
+                df = p.pivot_table(index="Company", columns="Sponsor", values="Net", aggfunc="sum", fill_value=0).reset_index() if len(p) else p
+            else:
+                df = split(p, {"Company-wise": "Company", "Section-wise": "Section", "Kofil-wise": "Sponsor"}[kind])
+        return df
+
+    shown = False
+    for gi, (a, b, cs) in enumerate(st.session_state["_grp_rep"]):
+        fi = (a, b, f[2], f[3], f[4], f[5], cs, f[7])
+        df = report_df(kind, fi)
+        if df.empty:
+            continue
+        shown = True
+        st.subheader(f"{kind}  |  Period {a} to {b}  -  {', '.join(cs) if cs else 'All companies'}")
+        st.dataframe(add_total(df), use_container_width=True, hide_index=True)
+        download(df, kind.replace(" ", "_").replace("(", "").replace(")", "").replace("/", ""), hdr_of(*fi[:7]), str(gi))
+    if not shown:
+        st.info("No data in this period.")
 
 # ---------------- Settings
 elif page == "Settings":
@@ -1406,7 +1500,7 @@ if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Transfer", "Setup", 
     elif page == "Setup":
         t1, t2, t3 = st.tabs(["Companies", "Sections", "Sponsors / Kofil"])
         with t1:
-            manage("companies", "SELECT id, name, vat FROM companies ORDER BY name", edit=["name", "vat"],
+            manage("companies", "SELECT id, name, vat, cycle_day FROM companies ORDER BY name", edit=["name", "vat", "cycle_day"],
                    used_in=[("employees", "company_id"), ("attendance", "company_id"), ("costs", "company_id"), ("transfers", "from_company"), ("transfers", "to_company")], key="mco")
         with t2:
             manage("departments", "SELECT id, name FROM departments ORDER BY name", edit=["name"],
