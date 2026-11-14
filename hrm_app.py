@@ -76,6 +76,15 @@ def ot_rate_of(rate, pay_type, ot_rate, ref):
     return round(rate / wd_m / float(S("std_hours")) * float(S("ot_mult")), 2)
 
 
+def hol_rate(hol, day, cid, sid, kid):
+    """None = not a special holiday for this company/section/kofil; else its rate per hour (0 = use the OT rate)."""
+    for h in hol.itertuples():
+        if (h.from_day <= day <= h.to_day and (pd.isna(h.company_id) or h.company_id == cid)
+                and (pd.isna(h.dept_id) or h.dept_id == sid) and (pd.isna(h.sponsor_id) or h.sponsor_id == kid)):
+            return float(h.rate or 0)
+    return None
+
+
 def eosb(r, upto):
     """End-of-service: half month wage/yr for first 5 yrs, one month wage/yr after (Saudi labour law style)."""
     yrs = max((upto - datetime.strptime(r.join_date, "%Y-%m-%d").date()).days / 365.25, 0)
@@ -91,7 +100,7 @@ def payslip_pdf(r, d1, d2):
     y = 800
     c.setFont("Helvetica-Bold", 16); c.drawString(50, y, f"{S('company')} - PAYSLIP"); y -= 25
     c.setFont("Helvetica", 11); c.drawString(50, y, f"Period: {d1} to {d2}"); y -= 30
-    money = {"Monthly Basic Rate", "Hr Rate", "OT Rate", "Basic", "Food", "OT Pay", "Wknd OT", "Allowances", "Bonus", "Advance", "Absent Ded", "Deduction", "Net"}
+    money = {"Monthly Basic Rate", "Hr Rate", "OT Rate", "Basic", "Food", "Special Allow", "Other Allow", "OT Pay", "Wknd OT", "Hol Pay", "Allowances", "Bonus", "Advance", "Absent Ded", "Deduction", "Net"}
     for k in r.index:
         if k in ("Invoice", "Bank", "Cash"):
             continue
@@ -201,11 +210,13 @@ def init():
         q("INSERT OR IGNORE INTO settings VALUES(?,?)", (k, v), fetch=False)
     q("CREATE TABLE IF NOT EXISTS companies(id INTEGER PRIMARY KEY, name TEXT UNIQUE, vat TEXT)", fetch=False)
     q("CREATE TABLE IF NOT EXISTS costs(id INTEGER PRIMARY KEY, day TEXT, category TEXT, emp_id INT, company_id INT, amount REAL, note TEXT)", fetch=False)
+    q("""CREATE TABLE IF NOT EXISTS holidays(id INTEGER PRIMARY KEY, from_day TEXT, to_day TEXT, company_id INT, dept_id INT,
+        sponsor_id INT, rate REAL DEFAULT 0, note TEXT)""", fetch=False)
     q("""CREATE TABLE IF NOT EXISTS transfers(id INTEGER PRIMARY KEY, emp_id INT, day TEXT, from_company INT, from_dept INT,
         from_sponsor INT, to_company INT, to_dept INT, to_sponsor INT, note TEXT)""", fetch=False)
     for t_, c_ in [("employees", "id_expiry TEXT"), ("employees", "company_id INT"), ("employees", "food_allow REAL DEFAULT 0"),
                    ("employees", "ot_rate REAL DEFAULT 0"), ("employees", "bill_rate REAL DEFAULT 0"),
-                   ("employees", "pay_mode TEXT DEFAULT 'Bank'"), ("attendance", "company_id INT"), ("attendance", "dept_id INT"), ("attendance", "ot_hours REAL"), ("employees", "passport_no TEXT"), ("attendance", "sponsor_id INT"), ("companies", "cycle_day INT DEFAULT 1")]:
+                   ("employees", "pay_mode TEXT DEFAULT 'Bank'"), ("attendance", "company_id INT"), ("attendance", "dept_id INT"), ("attendance", "ot_hours REAL"), ("employees", "passport_no TEXT"), ("attendance", "sponsor_id INT"), ("companies", "cycle_day INT DEFAULT 1"), ("employees", "special_allow REAL DEFAULT 0"), ("employees", "other_allow REAL DEFAULT 0")]:
         try:
             q(f"ALTER TABLE {t_} ADD COLUMN {c_}", fetch=False)
         except Exception:
@@ -234,7 +245,7 @@ def hrs(i, o):
 
 def emp_df(active=True):
     return q("""SELECT e.id, e.code, e.name, c.name AS company, d.name AS section, s.name AS sponsor, e.labour_type,
-        e.pay_type, e.pay_mode, e.rate, e.food_allow, e.ot_rate, e.bill_rate, e.nationality, e.id_no, e.passport_no, e.phone, e.join_date, e.id_expiry, e.company_id, e.dept_id, e.sponsor_id
+        e.pay_type, e.pay_mode, e.rate, e.food_allow, e.special_allow, e.other_allow, e.ot_rate, e.bill_rate, e.nationality, e.id_no, e.passport_no, e.phone, e.join_date, e.id_expiry, e.company_id, e.dept_id, e.sponsor_id
         FROM employees e LEFT JOIN companies c ON c.id=e.company_id LEFT JOIN departments d ON d.id=e.dept_id
         LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE e.active=?""", (1 if active else 0,))
 
@@ -454,15 +465,14 @@ def download(df, name, hdr="", uid=""):
         c[1].caption("pip install reportlab")
 
 
-PCOLS = ["Code", "Name", "Iqama ID", "Passport No", "Company", "Section", "Sponsor", "Labour", "Pay", "Mode",
+PCOLS = ["Code", "Name", "Join Date", "Iqama ID", "Passport No", "Company", "Section", "Sponsor", "Labour", "Pay", "Mode",
          "Monthly Basic Rate", "Hr Rate", "OT Rate", "Days", "Leave", "Absent", "Normal Hrs", "OT Hrs", "Wknd Hrs",
-         "Total Hrs", "Basic", "Food", "OT Pay", "Wknd OT", "Allowances", "Bonus", "Advance", "Absent Ded", "Deduction",
-         "Net", "Bank", "Cash", "Invoice"]
+         "Hol Hrs", "Total Hrs", "Basic", "Food", "Special Allow", "Other Allow", "OT Pay", "Wknd OT", "Hol Pay",
+         "Allowances", "Bonus", "Advance", "Absent Ded", "Deduction", "Net", "Bank", "Cash", "Invoice"]
 PVIEW = [c for c in PCOLS if c != "Invoice"]
 
 
 def _wd(y, m, we):
-    """Working days of a calendar month = days in month minus weekend days (31 days - 4 Fridays = 27)."""
     n = calendar.monthrange(y, m)[1]
     return n - sum(date(y, m, k).weekday() == we for k in range(1, n + 1))
 
@@ -475,25 +485,22 @@ def view_pay(p):
 
 
 def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs="", cyc=False):
-    """Monthly staff: Basic and Food = amount / working days of the month (days - Fridays) x working days of the period;
-    every working day that is Absent, Off or left unmarked (between the first and last marked day of the month) is shown
-    in 'Absent Ded'. Weekend work = OT only. One day's basic as Bonus for a full working month (all places together).
-    Hourly staff: normal hours x rate, OT / weekend hours x OT rate (own OT rate, else normal rate)."""
+    """Monthly staff (per month, or per pay period when cyc):
+      working days = days - Fridays - special holidays (for that company / kofil / section)
+      Basic, Food, Special & Other allowance = amount / working days x (present + leave working days)
+      each absent working day: that day's basic is not paid AND basic / total days of the month is deducted ('Absent Ded')
+      full month present: Bonus = basic / total days of the month; no deduction on food.
+      work on Friday = OT rate; work on a special holiday = holiday rate (0 = OT rate), all hours.
+    Hourly staff: normal hours x rate, OT / Friday hours x OT rate (own, else normal rate), holiday hours x holiday rate."""
     e = apply_f(emp_df(), (), lt, pt, (), (), qs)
     att = q("SELECT * FROM attendance WHERE day BETWEEN ? AND ?", (d1, d2))
     adj = q("SELECT * FROM adjustments WHERE day BETWEEN ? AND ?", (d1, d2))
+    hol = q("SELECT * FROM holidays")
     cn, sn, kn = (dict(q(f"SELECT id,name FROM {t}").values) for t in ("companies", "departments", "sponsors"))
     nm = lambda d, k: d.get(int(k), "-") if pd.notna(k) else "-"
     std, otm, we = float(S("std_hours")), float(S("ot_mult")), int(S("weekend"))
     gp, gn = float(S("gosi_pct")), S("gosi_nat").strip().lower()
     D1, D2 = date.fromisoformat(d1), date.fromisoformat(d2)
-
-    def _bounds(mth):   # (first day, last day, working days) of the calendar month - or of the whole pay period if cyc
-        if cyc:
-            return D1, D2, sum((D1 + timedelta(k)).weekday() != we for k in range((D2 - D1).days + 1))
-        y_, m_ = int(mth[:4]), int(mth[5:])
-        return date(y_, m_, 1), date(y_, m_, calendar.monthrange(y_, m_)[1]), _wd(y_, m_, we)
-
     rows = []
     for _, r in e.iterrows():
         a = att[att.emp_id == r.id].copy()
@@ -501,67 +508,91 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs="", cyc=False):
             continue
         a["cid"], a["sid"], a["kid"] = a.company_id.fillna(r.company_id), a.dept_id.fillna(r.dept_id), a.sponsor_id.fillna(r.sponsor_id)
         a["ot_hours"], a["hours"] = a.ot_hours.fillna(0), a.hours.fillna(0)
-        a["m"], a["wk"] = ("P" if cyc else a.day.str[:7]), pd.to_datetime(a.day).dt.weekday == we
+        a["m"] = "P" if cyc else a.day.str[:7]
+        a["wk"] = pd.to_datetime(a.day).dt.weekday == we
+        a["hr"] = [hol_rate(hol, d, c_, s_, k_) for d, c_, s_, k_ in zip(a.day, a.cid, a.sid, a.kid)]
+        a["hol"] = a.hr.notna()
+        a["nw"] = a.wk | a.hol
+        place = {d: (c_, s_, k_) for d, c_, s_, k_ in zip(a.day, a.cid, a.sid, a.kid)}
+        cur = (r.company_id, r.dept_id, r.sponsor_id)
+
+        def nonwork(d):
+            return d.weekday() == we or hol_rate(hol, str(d), *place.get(str(d), cur)) is not None
+
+        def bounds(mth):   # first day, last day, number of days, working days of the month (or of the whole pay period)
+            if cyc:
+                lo, nd = D1, (D2 - D1).days + 1
+            else:
+                y_, m_ = int(mth[:4]), int(mth[5:])
+                lo, nd = date(y_, m_, 1), calendar.monthrange(y_, m_)[1]
+            return lo, lo + timedelta(nd - 1), nd, max(sum(not nonwork(lo + timedelta(k)) for k in range(nd)), 1)
+
         ad = adj[adj.emp_id == r.id]
         monthly = r.pay_type == "Monthly"
         full, gap, gap_used = set(), {}, set()
         if monthly:
             for mth in a.m.unique():
-                lo, hi, wdm0 = _bounds(mth)
+                lo, hi, nd, wd0 = bounds(mth)
                 mr = a[a.m == mth]
                 da, db = date.fromisoformat(mr.day.min()), date.fromisoformat(mr.day.max())
-                span = sum((da + timedelta(k)).weekday() != we for k in range((db - da).days + 1))
-                nw = mr[~mr.wk]
-                gap[mth] = max(span - len(nw[nw.status.isin(["Present", "Leave", "Absent"])]), 0)
-                if lo >= D1 and hi <= D2 and len(nw[nw.status == "Present"]) >= wdm0:
+                span = sum(not nonwork(da + timedelta(k)) for k in range((db - da).days + 1))
+                nk = mr[~mr.nw]
+                gap[mth] = max(span - len(nk[nk.status.isin(["Present", "Leave", "Absent"])]), 0)
+                if lo >= D1 and hi <= D2 and len(nk[nk.status == "Present"]) >= wd0:
                     full.add(mth)
-        first = True
+        first, otr_show = True, 0.0
         for (cid, sid, kid), g in a.groupby(["cid", "sid", "kid"], dropna=False):
             pres = g[g.status == "Present"]
-            wkd, nor = pres[pres.wk], pres[~pres.wk]
-            ot_h, wk_h, reg_h = nor.ot_hours.sum(), (wkd.hours + wkd.ot_hours).sum(), nor.hours.sum()
-            basic = food = bonus = ot_pay = wk_pay = abs_ded = 0.0
+            nor, wkd, hold = pres[~pres.nw], pres[pres.wk & ~pres.hol], pres[pres.hol]
+            ot_h, reg_h = nor.ot_hours.sum(), nor.hours.sum()
+            wk_h, hol_h = (wkd.hours + wkd.ot_hours).sum(), (hold.hours + hold.ot_hours).sum()
+            basic = food = spa = oth = bonus = ot_pay = wk_pay = hol_pay = abs_ded = 0.0
             days_ab = (g.status == "Absent").sum()
             if monthly:
                 days_ab = 0
                 for mth, gm in g.groupby("m"):
-                    wdm = _bounds(mth)[2]
-                    otr = r.ot_rate if r.ot_rate > 0 else r.rate / wdm / std * otm
-                    p_, w_ = gm[(gm.status == "Present") & ~gm.wk], gm[(gm.status == "Present") & gm.wk]
-                    paid = len(p_) + len(gm[(gm.status == "Leave") & ~gm.wk])
-                    ab = len(gm[(gm.status == "Absent") & ~gm.wk])
+                    lo, hi, nd, wdm = bounds(mth)
+                    otr = otr_show = r.ot_rate if r.ot_rate > 0 else r.rate / wdm / std * otm
+                    p_ = gm[(gm.status == "Present") & ~gm.nw]
+                    w_ = gm[(gm.status == "Present") & gm.wk & ~gm.hol]
+                    h_ = gm[(gm.status == "Present") & gm.hol]
+                    paid = len(p_) + len(gm[(gm.status == "Leave") & ~gm.nw])
+                    ab = len(gm[(gm.status == "Absent") & ~gm.nw])
                     if mth not in gap_used:
                         ab += gap.get(mth, 0)
                         gap_used.add(mth)
                     days_ab += ab
-                    basic += r.rate / wdm * (paid + ab)
-                    food += r.food_allow / wdm * (paid + ab)
-                    abs_ded += (r.rate + r.food_allow) / wdm * ab
+                    basic += r.rate / wdm * paid
+                    food += r.food_allow / wdm * paid
+                    spa += r.special_allow / wdm * paid
+                    oth += r.other_allow / wdm * paid
+                    abs_ded += r.rate / nd * ab
                     ot_pay += p_.ot_hours.sum() * otr
                     wk_pay += (w_.hours + w_.ot_hours).sum() * otr
+                    hol_pay += ((h_.hours + h_.ot_hours) * h_.hr.where(h_.hr > 0, otr)).sum()
                     if mth in full:
-                        bonus += r.rate / wdm * len(p_) / wdm
-            elif r.ot_rate > 0:
-                basic, ot_pay, wk_pay = reg_h * r.rate, ot_h * r.ot_rate, wk_h * r.ot_rate
+                        bonus += r.rate / nd * len(p_) / wdm
             else:
-                basic = (reg_h + ot_h + wk_h) * r.rate
+                oe = otr_show = r.ot_rate if r.ot_rate > 0 else r.rate
+                basic, ot_pay, wk_pay = reg_h * r.rate, ot_h * oe, wk_h * oe
+                hol_pay = ((hold.hours + hold.ot_hours) * hold.hr.where(hold.hr > 0, oe)).sum()
             add = ad[~ad.kind.isin(["Advance", "Deduction"])].amount.sum() if first else 0
             adv = ad[ad.kind == "Advance"].amount.sum() if first else 0
             ded = ad[ad.kind == "Deduction"].amount.sum() if first else 0
             first = False
             ded += basic * gp / 100 if str(r.nationality).strip().lower() == gn else 0
-            net = basic + food + bonus + ot_pay + wk_pay + add - adv - abs_ded - ded
-            tot_h = reg_h + ot_h + wk_h
-            rows.append({"Code": r.code, "Name": r["name"], "Iqama ID": r.id_no or "", "Passport No": r.passport_no or "",
-                         "Company": nm(cn, cid), "Section": nm(sn, sid), "Sponsor": nm(kn, kid), "Labour": r.labour_type,
-                         "Pay": r.pay_type, "Mode": r.pay_mode, "Monthly Basic Rate": r.rate if monthly else 0,
-                         "Hr Rate": 0 if monthly else r.rate, "OT Rate": ot_rate_of(r.rate, r.pay_type, r.ot_rate, d2),
-                         "Days": len(pres), "Leave": (g.status == "Leave").sum(), "Absent": days_ab,
-                         "Normal Hrs": reg_h, "OT Hrs": ot_h, "Wknd Hrs": wk_h, "Total Hrs": tot_h, "Basic": basic,
-                         "Food": food, "OT Pay": ot_pay, "Wknd OT": wk_pay, "Allowances": add, "Bonus": bonus,
-                         "Advance": adv, "Absent Ded": abs_ded, "Deduction": ded, "Net": net,
-                         "Bank": net if r.pay_mode == "Bank" else 0, "Cash": net if r.pay_mode != "Bank" else 0,
-                         "Invoice": tot_h * r.bill_rate})
+            net = basic + food + spa + oth + bonus + ot_pay + wk_pay + hol_pay + add - adv - abs_ded - ded
+            tot_h = reg_h + ot_h + wk_h + hol_h
+            rows.append({"Code": r.code, "Name": r["name"], "Join Date": r.join_date, "Iqama ID": r.id_no or "",
+                         "Passport No": r.passport_no or "", "Company": nm(cn, cid), "Section": nm(sn, sid),
+                         "Sponsor": nm(kn, kid), "Labour": r.labour_type, "Pay": r.pay_type, "Mode": r.pay_mode,
+                         "Monthly Basic Rate": r.rate if monthly else 0, "Hr Rate": 0 if monthly else r.rate,
+                         "OT Rate": otr_show, "Days": len(pres), "Leave": (g.status == "Leave").sum(), "Absent": days_ab,
+                         "Normal Hrs": reg_h, "OT Hrs": ot_h, "Wknd Hrs": wk_h, "Hol Hrs": hol_h, "Total Hrs": tot_h,
+                         "Basic": basic, "Food": food, "Special Allow": spa, "Other Allow": oth, "OT Pay": ot_pay,
+                         "Wknd OT": wk_pay, "Hol Pay": hol_pay, "Allowances": add, "Bonus": bonus, "Advance": adv,
+                         "Absent Ded": abs_ded, "Deduction": ded, "Net": net, "Bank": net if r.pay_mode == "Bank" else 0,
+                         "Cash": net if r.pay_mode != "Bank" else 0, "Invoice": tot_h * r.bill_rate})
     df = pd.DataFrame(rows, columns=PCOLS).round(2)
     for col, v in (("Section", sec), ("Company", co), ("Sponsor", spn)):
         if v:
@@ -754,35 +785,42 @@ elif page == "Employees":
         c = st.columns(4)
         code, name = c[0].text_input("Code", key=f"e1{v}"), c[1].text_input("Name", key=f"e2{v}")
         nat, idn = c[2].text_input("Nationality", key=f"e3{v}"), c[3].text_input("ID / Iqama no.", key=f"e4{v}")
+        c = st.columns(4)
         pas = c[0].text_input("Passport no.", key=f"e5{v}")
         co = c[1].selectbox("Client company", ["-"] + cm.name.tolist(), key=f"e6{v}")
         sec = c[2].selectbox("Section", ["-"] + ds.name.tolist(), key=f"e7{v}")
         spn = c[3].selectbox("Sponsor / Kofil", ["-"] + sp.name.tolist(), key=f"e8{v}")
+        c = st.columns(4)
         lt = c[0].selectbox("Labour type", ["Company", "Outside"], key=f"e9{v}")
         pt = c[1].selectbox("Pay type", ["Monthly", "Hourly"], key=f"e10{v}")
         pm = c[2].selectbox("Pay mode", ["Bank", "Cash"], key=f"e11{v}")
         rate = c[3].number_input("Normal hour rate (per hour)" if pt == "Hourly" else "Monthly basic salary", 0.0,
                                  key=f"e12{v}{pt}")
-        food = c[0].number_input("Food allowance / month" + (" (monthly staff only)" if pt == "Hourly" else ""), 0.0,
-                                 key=f"e13{v}", disabled=pt == "Hourly")
-        otr = c[1].number_input("OT rate / hour (0 = auto)", 0.0, key=f"e14{v}")
-        bill = c[2].number_input("Bill rate / hour (client invoice)", 0.0, key=f"e15{v}")
-        ph, jd = c[3].text_input("Phone", key=f"e16{v}"), c[0].date_input("Join date", today(), key=f"e17{v}")
-        exp = c[1].date_input("ID expiry", today() + timedelta(days=365), key=f"e18{v}")
+        hr_, sfx = pt == "Hourly", (" (monthly staff only)" if pt == "Hourly" else "")
+        c = st.columns(4)
+        food = c[0].number_input("Food allowance / month" + sfx, 0.0, key=f"e13{v}", disabled=hr_)
+        spa = c[1].number_input("Special allowance / month" + sfx, 0.0, key=f"e19{v}", disabled=hr_)
+        oth = c[2].number_input("Other allowance / month" + sfx, 0.0, key=f"e20{v}", disabled=hr_)
+        otr = c[3].number_input("OT rate / hour (0 = auto)", 0.0, key=f"e14{v}")
+        c = st.columns(4)
+        bill = c[0].number_input("Bill rate / hour (client invoice)", 0.0, key=f"e15{v}")
+        ph, jd = c[1].text_input("Phone", key=f"e16{v}"), c[2].date_input("Join date", today(), key=f"e17{v}")
+        exp = c[3].date_input("ID expiry", today() + timedelta(days=365), key=f"e18{v}")
         if st.button("💾 Save employee", key=f"esave{v}") and code and name:
             save_emp(dict(code=code, name=name, nationality=nat, id_no=idn, passport_no=pas, company_id=pick(cm, co),
                           dept_id=pick(ds, sec), sponsor_id=pick(sp, spn), labour_type=lt, pay_type=pt, pay_mode=pm,
-                          rate=rate, food_allow=0.0 if pt == "Hourly" else food, ot_rate=otr, bill_rate=bill, phone=ph,
+                          rate=rate, food_allow=0.0 if hr_ else food, special_allow=0.0 if hr_ else spa,
+                          other_allow=0.0 if hr_ else oth, ot_rate=otr, bill_rate=bill, phone=ph,
                           join_date=str(jd), id_expiry=str(exp)))
             st.session_state["empv"], st.session_state["flash_emp"] = v + 1, f"Saved {code}"
             st.rerun()
     f = filters("emp")
     df = apply_f(emp_df(), *f[2:]).drop(columns=["id", "company_id", "dept_id", "sponsor_id"])
     df["monthly_basic_rate"], df["hr_rate"] = df.rate.where(df.pay_type == "Monthly", 0), df.rate.where(df.pay_type == "Hourly", 0)
-    df = df.rename(columns={"id_no": "iqama_id"})[["code", "name", "iqama_id", "passport_no", "company", "section", "sponsor",
-                                                   "labour_type", "pay_type", "pay_mode", "monthly_basic_rate", "hr_rate",
-                                                   "ot_rate", "food_allow", "bill_rate", "nationality", "phone",
-                                                   "join_date", "id_expiry"]]
+    df = df.rename(columns={"id_no": "iqama_id"})[["code", "name", "join_date", "iqama_id", "passport_no", "company", "section",
+                                                   "sponsor", "labour_type", "pay_type", "pay_mode", "monthly_basic_rate",
+                                                   "hr_rate", "ot_rate", "food_allow", "special_allow", "other_allow",
+                                                   "bill_rate", "nationality", "phone", "id_expiry"]]
     st.dataframe(add_total(df), use_container_width=True, hide_index=True)
     download(df, "employees", hdr_of(*f[:7]))
     if len(df):
@@ -907,6 +945,7 @@ elif page == "Attendance":
         old = q("SELECT * FROM attendance WHERE day=?", (str(day),))
         dn, do_ = float(S("def_normal")), float(S("def_ot"))
         wkend = day.weekday() == int(S("weekend"))
+        hol, hflag = q("SELECT * FROM holidays"), False
         nm = lambda v, d: d.get(int(v), "") if pd.notna(v) else ""
         rows = []
         for _, r in e.iterrows():
@@ -914,7 +953,9 @@ elif page == "Attendance":
             h = o.iloc[0] if len(o) else None
             cur = CODE.get(h["status"], "P") if h is not None else None
             g = lambda col, dflt: h[col] if h is not None and pd.notna(h[col]) else dflt
-            stt = pick[-1] if pick != "—" else (cur or ("O" if wkend else "P"))
+            is_h = hol_rate(hol, str(day), r.company_id, r.dept_id, r.sponsor_id) is not None
+            hflag = hflag or is_h
+            stt = pick[-1] if pick != "—" else (cur or ("O" if (wkend or is_h) else "P"))
             sv = cur == "P" and stt == "P"
             nh, oh = (float(g("hours", dn)), float(g("ot_hours", 0.0))) if sv else (dn, do_)
             rows.append({"id": r.id, "Code": r.code, "Name": r["name"], "Iqama ID": r.id_no or "",
@@ -926,6 +967,9 @@ elif page == "Attendance":
         if wkend:
             st.info("This date is the weekend day: everyone starts as O (no work, no pay). Change to P only for those "
                     "who worked - all their hours are then paid as OT.")
+        if hflag:
+            st.info("Special holiday today for some of these staff: they start as O (no work, no pay). Mark P only for "
+                    "those who worked - all their hours are paid at the holiday rate (or their OT rate).")
         ed = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True,
                             key=f"att{day}{fco}{fsec}{fspn}{pick}{qs}",
                             disabled=["id", "Code", "Name", "Iqama ID", "Passport No", "Pay Type", "Labour", "Sponsor",
@@ -1147,7 +1191,7 @@ elif page == "Invoices":
 elif page == "Import":
     st.header("Bulk import employees (Excel / CSV)")
     T = ["Code", "Name", "Nationality", "ID No", "Passport No", "Phone", "Company", "Section", "Sponsor", "Labour Type", "Pay Type",
-         "Pay Mode", "Rate", "Food Allow", "OT Rate", "Bill Rate", "Join Date", "ID Expiry"]
+         "Pay Mode", "Rate", "Food Allow", "Special Allow", "Other Allow", "OT Rate", "Bill Rate", "Join Date", "ID Expiry"]
     st.download_button("⬇ Download template", pd.DataFrame(columns=T).to_csv(index=False), "employee_template.csv")
     st.caption("Labour Type: Company / Outside. Pay Type: Monthly / Hourly. Pay Mode: Bank / Cash. "
                "Companies, sections and sponsors are created automatically. Same Code = update.")
@@ -1176,7 +1220,7 @@ elif page == "Import":
                               dept_id=idof("departments", r.get("Section")), sponsor_id=idof("sponsors", r.get("Sponsor")),
                               labour_type=txt(r.get("Labour Type")) or "Company", pay_type=txt(r.get("Pay Type")) or "Monthly",
                               pay_mode=txt(r.get("Pay Mode")) or "Bank", rate=num(r.get("Rate")),
-                              food_allow=num(r.get("Food Allow")), ot_rate=num(r.get("OT Rate")),
+                              food_allow=num(r.get("Food Allow")), special_allow=num(r.get("Special Allow")), other_allow=num(r.get("Other Allow")), ot_rate=num(r.get("OT Rate")),
                               bill_rate=num(r.get("Bill Rate")), join_date=dt(r.get("Join Date")) or str(today()),
                               id_expiry=dt(r.get("ID Expiry"))))
                 n += 1
@@ -1267,12 +1311,12 @@ elif page == "Reports":
             p = calc_payroll(*f, cyc=cyc_)
             if kind == "Attendance summary":
                 df = sign(p[["Code", "Name", "Iqama ID", "Passport No", "Company", "Section", "Sponsor", "Labour", "Pay", "Days",
-                             "Leave", "Absent", "Normal Hrs", "OT Hrs", "Wknd Hrs", "Total Hrs"]])
+                             "Leave", "Absent", "Normal Hrs", "OT Hrs", "Wknd Hrs", "Hol Hrs", "Total Hrs"]])
             elif kind == "Payroll sheet":
                 df = view_pay(p)
             elif kind == "Hours (hourly basis)":
                 df = sign(p[p.Pay == "Hourly"][["Code", "Name", "Iqama ID", "Passport No", "Company", "Section", "Sponsor",
-                                                "Hr Rate", "OT Rate", "Normal Hrs", "OT Hrs", "Wknd Hrs", "Total Hrs", "Net"]])
+                                                "Hr Rate", "OT Rate", "Normal Hrs", "OT Hrs", "Wknd Hrs", "Hol Hrs", "Total Hrs", "Net"]])
             elif kind == "Company x Kofil matrix":
                 df = p.pivot_table(index="Company", columns="Sponsor", values="Net", aggfunc="sum", fill_value=0).reset_index() if len(p) else p
             else:
@@ -1316,6 +1360,28 @@ elif page == "Settings":
                              ot_mult=ot, date_fmt=df_, gosi_pct=gp, gosi_nat=gn, vat_pct=vp, weekend=days.index(wk), def_normal=dn, def_ot=do_).items():
                 q("REPLACE INTO settings VALUES(?,?)", (k, str(v)), fetch=False)
             st.success("Saved"); st.rerun()
+    st.divider()
+    st.subheader("Special holidays (Eid / special days)")
+    st.caption("From the date you give, for the number of days you give. These days are left out of the month's working days "
+               "(like Fridays) for the chosen Company / Kofil / Section (All = everyone). Staff who work get all their hours "
+               "at the holiday rate per hour; rate 0 = their OT rate.")
+    cm_, ds_, sp_ = q("SELECT * FROM companies"), q("SELECT * FROM departments"), q("SELECT * FROM sponsors")
+    c = st.columns(4)
+    hf = c[0].date_input("From date", today(), key="hol_f")
+    hn = c[1].number_input("Number of days", 1, 30, 1, key="hol_n")
+    hco = c[2].selectbox("Company", ["All"] + cm_.name.tolist(), key="hol_c")
+    hsp = c[3].selectbox("Sponsor / Kofil", ["All"] + sp_.name.tolist(), key="hol_k")
+    c = st.columns(4)
+    hse = c[0].selectbox("Section", ["All"] + ds_.name.tolist(), key="hol_s")
+    hrt = c[1].number_input("Holiday rate per hour (0 = OT rate)", 0.0, key="hol_r")
+    hnt = c[2].text_input("Note (e.g. Eid al-Fitr)", key="hol_t")
+    if c[3].button("➕ Add special holiday", key="hol_add"):
+        idf = lambda t, n: None if n == "All" else int(t[t.name == n].id.iloc[0])
+        q("INSERT INTO holidays(from_day,to_day,company_id,dept_id,sponsor_id,rate,note) VALUES(?,?,?,?,?,?,?)",
+          (str(hf), str(hf + timedelta(days=int(hn) - 1)), idf(cm_, hco), idf(ds_, hse), idf(sp_, hsp), float(hrt), hnt),
+          fetch=False)
+        st.session_state["flash"] = "Special holiday added"
+        st.rerun()
 
 
 # =====================================================================================
@@ -1475,7 +1541,7 @@ def att_post(df):   # extra display columns for the attendance records grid
     return df.drop(columns=["_rate", "_otr"])
 
 
-if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Transfer", "Setup", "Attendance", "Leave", "Adjustments", "Costs", "Users"):
+if role in CAN_EDIT + CAN_DELETE and page in ("Settings", "Employees", "Transfer", "Setup", "Attendance", "Leave", "Adjustments", "Costs", "Users"):
     st.divider()
     st.subheader("✏️ Edit / 🗑 Delete")
     st.caption("Choose Company / Section / Kofil (or All), change cells, then press Save. To delete: tick 'Delete', "
@@ -1486,9 +1552,9 @@ if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Transfer", "Setup", 
 
     if page == "Employees":
         manage("employees", """SELECT e.id, e.code, e.name, c.name AS company, d.name AS section, s.name AS sponsor,
-            e.labour_type, e.pay_type, e.pay_mode, e.rate, e.food_allow, e.ot_rate, e.bill_rate, e.nationality,
+            e.labour_type, e.pay_type, e.pay_mode, e.rate, e.food_allow, e.special_allow, e.other_allow, e.ot_rate, e.bill_rate, e.nationality,
             e.id_no, e.passport_no, e.phone, e.join_date, e.id_expiry, e.active FROM employees e""" + EJ + "ORDER BY e.code",
-               edit=["code", "name", "labour_type", "pay_type", "pay_mode", "rate", "food_allow", "ot_rate", "bill_rate",
+               edit=["code", "name", "labour_type", "pay_type", "pay_mode", "rate", "food_allow", "special_allow", "other_allow", "ot_rate", "bill_rate",
                      "nationality", "id_no", "passport_no", "phone", "join_date", "id_expiry", "active"],
                fks={"company": ("company_id", "companies"), "section": ("dept_id", "departments"),
                     "sponsor": ("sponsor_id", "sponsors")},
@@ -1552,6 +1618,15 @@ if role in CAN_EDIT + CAN_DELETE and page in ("Employees", "Transfer", "Setup", 
                selects={"category": ["ID / Iqama (Juazat)", "Work permit", "Insurance", "Transfer", "Muqeem / Monduf fee",
                                      "Exit re-entry", "Passport", "Medical", "Vacation ticket", "GOSI", "Other"]},
                key="cst", flt="xcost", cols=cc[2:])
+
+    elif page == "Settings":
+        manage("holidays", """SELECT h.id, h.from_day, h.to_day, c.name AS company, d.name AS section, s.name AS sponsor,
+            h.rate, h.note FROM holidays h LEFT JOIN companies c ON c.id=h.company_id
+            LEFT JOIN departments d ON d.id=h.dept_id LEFT JOIN sponsors s ON s.id=h.sponsor_id ORDER BY h.from_day DESC""",
+               edit=["from_day", "to_day", "rate", "note"],
+               fks={"company": ("company_id", "companies"), "section": ("dept_id", "departments"),
+                    "sponsor": ("sponsor_id", "sponsors")}, key="hol")
+        st.caption("Empty Company / Section / Kofil = applies to everyone. Dates are YYYY-MM-DD.")
 
     elif page == "Transfer":
         cc = st.columns(7)
