@@ -11,6 +11,25 @@ DB = "hrm.db"
 CODE = {"Present": "P", "Absent": "A", "Leave": "L", "Off": "O"}
 REV = {v: k for k, v in CODE.items()}
 LBL = {"P": "🟢 P", "A": "🔴 A", "L": "🟡 L", "O": "⚪ O"}
+
+
+def _dmy(fn):
+    def w(*a, **k):
+        k.setdefault("format", "DD/MM/YYYY")
+        try:
+            return fn(*a, **k)
+        except TypeError:
+            k.pop("format", None)
+            return fn(*a, **k)
+    return w
+
+
+try:
+    from streamlit.delta_generator import DeltaGenerator
+    DeltaGenerator.date_input = _dmy(DeltaGenerator.date_input)
+except Exception:
+    pass
+st.date_input = _dmy(st.date_input)
 st.set_page_config(page_title="HRM", layout="wide")
 st.markdown("""<style>
 .stApp{background:#eef5ef;color:#1b2b22}
@@ -38,6 +57,10 @@ st.markdown("""<style>
 .bars span{width:70%;background:#2e7d4f;border-radius:4px 4px 0 0;display:block}
 [data-baseweb="select"]>div{background:#eaf5ee;border:1.5px solid #2e7d4f}
 [data-baseweb="tag"]{background-color:#2e7d4f !important;color:#fff !important}
+.stButton>button:hover,[data-testid="stDownloadButton"] button:hover,[data-testid="stFormSubmitButton"] button:hover{background:#ff2e93 !important;color:#fff !important;border-color:#ff2e93 !important}
+[role="option"]:hover,li[role="option"]:hover{background:#ff7ab8 !important;color:#fff !important}
+[data-testid="stSidebar"] label:hover{background:rgba(255,46,147,.40) !important;border-radius:8px}
+[data-testid="stTabs"] button:hover,[data-testid="stExpander"] summary:hover{color:#ff2e93 !important}
 </style>""", unsafe_allow_html=True)
 _COL = {"co": "#1f3a5f", "sec": "#e67e22", "spn": "#7d3c98", "lab": "#117a8b", "pay": "#2ea05a", "st": "#b7950b", "dt": "#64748b"}
 # each coloured frame is preceded by an invisible marker (<span class="cb cb-co">); CSS colours the frame that follows it
@@ -212,6 +235,8 @@ def init():
     q("CREATE TABLE IF NOT EXISTS costs(id INTEGER PRIMARY KEY, day TEXT, category TEXT, emp_id INT, company_id INT, amount REAL, note TEXT)", fetch=False)
     q("""CREATE TABLE IF NOT EXISTS holidays(id INTEGER PRIMARY KEY, from_day TEXT, to_day TEXT, company_id INT, dept_id INT,
         sponsor_id INT, rate REAL DEFAULT 0, note TEXT)""", fetch=False)
+    q("""CREATE TABLE IF NOT EXISTS commissions(id INTEGER PRIMARY KEY, person TEXT, phone TEXT, company_id INT, dept_id INT,
+        sponsor_id INT, rate REAL DEFAULT 0, note TEXT, active INT DEFAULT 1)""", fetch=False)
     q("""CREATE TABLE IF NOT EXISTS transfers(id INTEGER PRIMARY KEY, emp_id INT, day TEXT, from_company INT, from_dept INT,
         from_sponsor INT, to_company INT, to_dept INT, to_sponsor INT, note TEXT)""", fetch=False)
     for t_, c_ in [("employees", "id_expiry TEXT"), ("employees", "company_id INT"), ("employees", "food_allow REAL DEFAULT 0"),
@@ -245,9 +270,9 @@ def hrs(i, o):
 
 def emp_df(active=True):
     return q("""SELECT e.id, e.code, e.name, c.name AS company, d.name AS section, s.name AS sponsor, e.labour_type,
-        e.pay_type, e.pay_mode, e.rate, e.food_allow, e.special_allow, e.other_allow, e.ot_rate, e.bill_rate, e.nationality, e.id_no, e.passport_no, e.phone, e.join_date, e.id_expiry, e.company_id, e.dept_id, e.sponsor_id
+        e.pay_type, e.pay_mode, e.rate, e.food_allow, e.special_allow, e.other_allow, e.ot_rate, e.bill_rate, e.nationality, e.id_no, e.passport_no, e.phone, e.join_date, e.id_expiry, e.company_id, e.dept_id, e.sponsor_id, e.active
         FROM employees e LEFT JOIN companies c ON c.id=e.company_id LEFT JOIN departments d ON d.id=e.dept_id
-        LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE e.active=?""", (1 if active else 0,))
+        LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE (? IS NULL OR e.active=?)""", (None if active is None else int(bool(active)),) * 2)
 
 
 def save_emp(d):
@@ -349,8 +374,9 @@ def pay_filters(key):
         fm = lambda x: date.fromisoformat(x).strftime("%d %b %Y")
         st.info(f"For the month of **{mo.upper()}-{yr}**   |   Period:  " +
                 "   ||   ".join(f"**{', '.join(v)}**: {fm(a)} to {fm(b)}" for a, b, v in groups))
-    qs = st.text_input("🔎 Search code / name", key=key + "h")
+    qs = search_box("🔎 Search code / name", key + "h")
     st.session_state["_grp_" + key], st.session_state["_cyc_" + key] = groups, not custom
+    st.session_state["_monlab"] = "" if custom else f"For the month of {mo}-{yr}"
     return min(g[0] for g in groups), max(g[1] for g in groups), sec, lt, pt, spn, co, qs
 
 
@@ -370,7 +396,8 @@ def filters(key):
         pt = eff(msel("Pay type", ["Monthly", "Hourly"], key + "_pay"), ["Monthly", "Hourly"])
     with c[6]:
         spn = eff(msel("Sponsor / Kofil", spns, key + "_spn"), spns)
-    qs = st.text_input("🔎 Search code / name", key=key + "h")
+    qs = search_box("🔎 Search code / name", key + "h")
+    st.session_state["_monlab"] = ""
     return str(d1), str(d2), sec, lt, pt, spn, co, qs
 
 
@@ -388,21 +415,47 @@ def apply_f(df, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
 
 
 RATECOLS = {"rate", "Rate", "Monthly Basic Rate", "Hr Rate", "OT Rate", "OT_Rate", "ot_rate", "bill_rate", "Rate/hr", "active",
-            "id", "monthly_basic_rate", "hr_rate", "Years", "Monthly wage", "ot_rate_"}
+            "id", "monthly_basic_rate", "hr_rate", "Years", "Monthly wage", "cycle_day"}
 
 
-def add_total(df):
-    """Append a TOTAL row (sum of every numeric column except rates)."""
-    if df.empty or df.iloc[:, 0].astype(str).str.upper().str.startswith("TOTAL").any():
+def add_total(df, total=True):
+    """S/L serial numbers + a TOTAL row (sum of every numeric column except rates)."""
+    if df.empty:
         return df
-    isn = lambda c: pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_bool_dtype(df[c])
-    num = [c for c in df.columns if isn(c) and c not in RATECOLS and "rate" not in str(c).lower()]
-    if not num:
-        return df
-    t = {c: (float("nan") if isn(c) else "") for c in df.columns}
-    t.update({c: round(float(df[c].sum()), 2) for c in num})
-    t[next((c for c in df.columns if not isn(c)), df.columns[0])] = f"TOTAL ({len(df)})"
-    return pd.concat([df, pd.DataFrame([t])], ignore_index=True)
+    d = df.copy()
+    fc = d.columns[1] if d.columns[0] == "S/L" and len(d.columns) > 1 else d.columns[0]
+    if d[fc].astype(str).str.upper().str.startswith("TOTAL").any():
+        return d
+    d.insert(0, "S/L", [str(i) for i in range(1, len(d) + 1)]) if "S/L" not in d.columns else d.__setitem__("S/L", d["S/L"].astype(str))
+    isn = lambda c: pd.api.types.is_numeric_dtype(d[c]) and not pd.api.types.is_bool_dtype(d[c])
+    num = [c for c in d.columns if isn(c) and c not in RATECOLS and "rate" not in str(c).lower()]
+    if not total or not num:
+        return d
+    t = {c: (float("nan") if isn(c) else "") for c in d.columns}
+    t.update({c: round(float(d[c].sum()), 2) for c in num})
+    t[next(c for c in d.columns if c != "S/L" and not isn(c))] = f"TOTAL ({len(d)})"
+    return pd.concat([d, pd.DataFrame([t])], ignore_index=True)
+
+
+def tbl(df, total=True):
+    """Show a table with S/L and a coloured, bold TOTAL row."""
+    d = add_total(df, total)
+    try:
+        isT = d.astype(str).apply(lambda r: r.str.startswith("TOTAL").any(), axis=1)
+        sty = d.style.format(precision=2, na_rep="").apply(
+            lambda r: ["background-color:#fde68a;color:#7c2d12;font-weight:800" if isT[r.name] else "" for _ in r], axis=1)
+        st.dataframe(sty, use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(d, use_container_width=True, hide_index=True)
+
+
+def search_box(label, key):
+    """Search that filters while you type (needs the 'streamlit-keyup' package; falls back to Enter-to-search)."""
+    try:
+        from st_keyup import st_keyup
+        return st_keyup(label, key=key, debounce=250) or ""
+    except Exception:
+        return st.text_input(label, key=key)
 
 
 def sign(df):
@@ -411,10 +464,25 @@ def sign(df):
     return df
 
 
+def dmy(x):
+    try:
+        return date.fromisoformat(str(x)[:10]).strftime("%d/%m/%Y")
+    except Exception:
+        return str(x)
+
+
+class Hdr(str):
+    """Header text that also carries its parts (company, kofil, month) for the custom print."""
+
+
 def hdr_of(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
     j = lambda x: ", ".join(x) if x else "All"
-    return (f"Period: {d1} to {d2}   |   Company: {j(co)}   |   Kofil: {j(spn)}   |   Section: {j(sec)}   |   "
+    h = Hdr(f"Period: {dmy(d1)} to {dmy(d2)}   |   Company: {j(co)}   |   Kofil: {j(spn)}   |   Section: {j(sec)}   |   "
             f"Labour: {j(lt)}   |   Pay type: {j(pt)}")
+    h.co, h.kofil = j(co), j(spn)
+    h.left = [f"Period from: {dmy(d1)}  to  {dmy(d2)}", f"Section: {j(sec)}", f"Labour: {j(lt)}", f"Pay type: {j(pt)}"]
+    h.month = st.session_state.get("_monlab", "") or f"{dmy(d1)} to {dmy(d2)}"
+    return h
 
 
 def df_pdf(df, title, hdr=""):
@@ -427,6 +495,7 @@ def df_pdf(df, title, hdr=""):
     W, H = landscape(A3 if n > 14 else A4)
     fmt = lambda v: "" if pd.isna(v) else (f"{v:,.2f}" if isinstance(v, float) else str(v))
     data = [[str(c) for c in df.columns]] + [[fmt(v)[:24] for v in row] for row in df.itertuples(index=False)]
+    istot = len(data) > 1 and any(c.startswith("TOTAL") for c in data[-1])
     lens = [max(3, max(len(r_[i]) for r_ in data)) for i in range(n)]
     fs = 8.0
     while True:
@@ -441,21 +510,74 @@ def df_pdf(df, title, hdr=""):
            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
            ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
            ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2)]
-    if len(data) > 1 and data[-1][0].startswith("TOTAL"):
-        st_ += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#dfeee4"))]
+    if istot:
+        st_ += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#fde68a")),
+                ("TEXTCOLOR", (0, -1), (-1, -1), colors.HexColor("#7c2d12"))]
     t.setStyle(TableStyle(st_))
     sty = getSampleStyleSheet()
     sm = ParagraphStyle("sm", parent=sty["Normal"], fontSize=8, leading=10)
     SimpleDocTemplate(b, pagesize=(W, H), leftMargin=m, rightMargin=m, topMargin=m, bottomMargin=m).build([
         Paragraph(f"<b>{S('company')} - {title}</b>", ParagraphStyle("h", parent=sty["Title"], fontSize=14, leading=16, spaceAfter=2)),
-        Paragraph(hdr, sm), Paragraph(f"Printed {today()}  |  {len(df) - (1 if len(data) > 1 and data[-1][0].startswith('TOTAL') else 0)} rows", sm),
+        Paragraph(str(hdr), sm), Paragraph(f"Printed {dmy(today())}  |  {len(df) - (1 if istot else 0)} rows", sm),
         Spacer(1, 4), t])
+    return b.getvalue()
+
+
+def df_pdf_custom(df, cols, rowh, hdr, title):
+    """Only the chosen columns, your row height, and a header on EVERY page: client company (big, bold),
+    kofil (bold) and 'For the month of ...' centred; period / section / labour / pay type at the top left."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A3, A4, landscape
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate, Table, TableStyle
+    d = df[[c for c in df.columns if c in cols]]
+    b, n, m, top = io.BytesIO(), max(len(d.columns), 1), 18, 96
+    W, H = landscape(A3 if n > 14 else A4)
+    fs = max(5.0, min(11.0, rowh * 0.5))
+    fmt = lambda v: "" if pd.isna(v) else (f"{v:,.2f}" if isinstance(v, float) else str(v))
+    data = [[str(c) for c in d.columns]] + [[fmt(v)[:28] for v in row] for row in d.itertuples(index=False)]
+    istot = len(data) > 1 and any(c.startswith("TOTAL") for c in data[-1])
+    wid = [max(3, max(len(r_[i]) for r_ in data)) * fs * 0.56 + 6 for i in range(n)]
+    k = min((W - 2 * m) / sum(wid), 1.6)
+    t = Table(data, colWidths=[w * k for w in wid], rowHeights=[rowh] * len(data), repeatRows=1)
+    st_ = [("FONTSIZE", (0, 0), (-1, -1), fs), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#14472f")),
+           ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
+           ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+           ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]
+    if istot:
+        st_ += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#fde68a")),
+                ("TEXTCOLOR", (0, -1), (-1, -1), colors.HexColor("#7c2d12"))]
+    t.setStyle(TableStyle(st_))
+    co_ = getattr(hdr, "co", "All") + (" " if getattr(hdr, "co", "") else "")
+    lines = [(f"{getattr(hdr, 'co', 'All')}", "Helvetica-Bold", 17), (f"Sponsor / Kofil: {getattr(hdr, 'kofil', 'All')}", "Helvetica-Bold", 12),
+             (getattr(hdr, "month", ""), "Helvetica-Bold", 11)]
+
+    def head(c, doc):
+        c.saveState()
+        y = H - 26
+        for txt, fn, sz in lines:
+            while sz > 7 and stringWidth(txt, fn, sz) > W - 360:
+                sz -= 0.5
+            c.setFont(fn, sz)
+            c.drawCentredString(W / 2, y, txt)
+            y -= sz + 5
+        c.setFont("Helvetica", 8)
+        for i, ln in enumerate(getattr(hdr, "left", [str(hdr)])):
+            c.drawString(m, H - 20 - i * 10, ln)
+        c.drawRightString(W - m, H - 20, f"{S('company')} - {title}")
+        c.drawRightString(W - m, H - 30, f"Page {doc.page}   |   Printed {dmy(today())}")
+        c.restoreState()
+
+    doc = BaseDocTemplate(b, pagesize=(W, H), leftMargin=m, rightMargin=m, topMargin=top, bottomMargin=m)
+    doc.addPageTemplates([PageTemplate(frames=[Frame(m, m, W - 2 * m, H - top - m, id="f", leftPadding=0, rightPadding=0,
+                                                      topPadding=0, bottomPadding=0)], onPage=head)])
+    doc.build([t])
     return b.getvalue()
 
 
 def download(df, name, hdr="", uid=""):
     df = add_total(df)
-    c = st.columns([1, 1, 6])
+    c = st.columns([1, 1.3, 1.3, 6])
     c[0].download_button("⬇ CSV", df.to_csv(index=False).encode("utf-8-sig"), f"{name}_{today()}.csv", "text/csv",
                          key="csv_" + name + uid)
     try:
@@ -463,6 +585,14 @@ def download(df, name, hdr="", uid=""):
                              "application/pdf", key="pdf_" + name + uid)
     except ImportError:
         c[1].caption("pip install reportlab")
+        return
+    if c[2].checkbox("🖨 Custom print", key="cp_" + name + uid):
+        cc = st.columns([4, 1, 1])
+        cols = cc[0].multiselect("Columns to print (only these are printed)", list(df.columns), default=list(df.columns),
+                                 key="cpc_" + name + uid)
+        rh = cc[1].number_input("Row height (px)", 8, 300, 22, key="cph_" + name + uid)
+        cc[2].download_button("⬇ Custom PDF", df_pdf_custom(df, cols, rh, hdr, name.replace("_", " ")),
+                              f"{name}_custom_{today()}.pdf", "application/pdf", key="cpd_" + name + uid)
 
 
 PCOLS = ["Code", "Name", "Join Date", "Iqama ID", "Passport No", "Company", "Section", "Sponsor", "Labour", "Pay", "Mode",
@@ -470,6 +600,9 @@ PCOLS = ["Code", "Name", "Join Date", "Iqama ID", "Passport No", "Company", "Sec
          "Hol Hrs", "Total Hrs", "Basic", "Food", "Special Allow", "Other Allow", "OT Pay", "Wknd OT", "Hol Pay",
          "Allowances", "Bonus", "Advance", "Absent Ded", "Deduction", "Net", "Bank", "Cash", "Invoice"]
 PVIEW = [c for c in PCOLS if c != "Invoice"]
+SUMC = ["Days", "Leave", "Absent", "Normal Hrs", "OT Hrs", "Wknd Hrs", "Hol Hrs", "Total Hrs", "Basic", "Food", "Special Allow",
+        "Other Allow", "OT Pay", "Wknd OT", "Hol Pay", "Allowances", "Bonus", "Advance", "Absent Ded", "Deduction", "Net",
+        "Bank", "Cash", "Invoice"]
 
 
 def _wd(y, m, we):
@@ -484,7 +617,7 @@ def view_pay(p):
     return sign(d)
 
 
-def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs="", cyc=False):
+def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs="", cyc=False, merge=True):
     """Monthly staff (per month, or per pay period when cyc):
       working days = days - Fridays - special holidays (for that company / kofil / section)
       Basic, Food, Special & Other allowance = amount / working days x (present + leave working days)
@@ -492,7 +625,7 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs="", cyc=False):
       full month present: Bonus = basic / total days of the month; no deduction on food.
       work on Friday = OT rate; work on a special holiday = holiday rate (0 = OT rate), all hours.
     Hourly staff: normal hours x rate, OT / Friday hours x OT rate (own, else normal rate), holiday hours x holiday rate."""
-    e = apply_f(emp_df(), (), lt, pt, (), (), qs)
+    e = apply_f(emp_df(None), (), lt, pt, (), (), qs)   # deactivated staff stay in old periods
     att = q("SELECT * FROM attendance WHERE day BETWEEN ? AND ?", (d1, d2))
     adj = q("SELECT * FROM adjustments WHERE day BETWEEN ? AND ?", (d1, d2))
     hol = q("SELECT * FROM holidays")
@@ -529,7 +662,7 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs="", cyc=False):
 
         ad = adj[adj.emp_id == r.id]
         monthly = r.pay_type == "Monthly"
-        full, gap, gap_used = set(), {}, set()
+        full, gap, gap_used, pall, spa_used = set(), {}, set(), {}, set()
         if monthly:
             for mth in a.m.unique():
                 lo, hi, nd, wd0 = bounds(mth)
@@ -538,8 +671,10 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs="", cyc=False):
                 span = sum(not nonwork(da + timedelta(k)) for k in range((db - da).days + 1))
                 nk = mr[~mr.nw]
                 gap[mth] = max(span - len(nk[nk.status.isin(["Present", "Leave", "Absent"])]), 0)
+                pall[mth] = len(nk[nk.status.isin(["Present", "Leave"])])
                 if lo >= D1 and hi <= D2 and len(nk[nk.status == "Present"]) >= wd0:
                     full.add(mth)
+        erows = []
         first, otr_show = True, 0.0
         for (cid, sid, kid), g in a.groupby(["cid", "sid", "kid"], dropna=False):
             pres = g[g.status == "Present"]
@@ -564,7 +699,11 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs="", cyc=False):
                     days_ab += ab
                     basic += r.rate / wdm * paid
                     food += r.food_allow / wdm * paid
-                    spa += r.special_allow / wdm * paid
+                    if pall.get(mth):
+                        spa += r.special_allow * paid / pall[mth]    # fixed amount, shared by days worked at each place
+                    elif mth not in spa_used:
+                        spa += r.special_allow
+                        spa_used.add(mth)
                     oth += r.other_allow / wdm * paid
                     abs_ded += r.rate / nd * ab
                     ot_pay += p_.ot_hours.sum() * otr
@@ -583,7 +722,7 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs="", cyc=False):
             ded += basic * gp / 100 if str(r.nationality).strip().lower() == gn else 0
             net = basic + food + spa + oth + bonus + ot_pay + wk_pay + hol_pay + add - adv - abs_ded - ded
             tot_h = reg_h + ot_h + wk_h + hol_h
-            rows.append({"Code": r.code, "Name": r["name"], "Join Date": r.join_date, "Iqama ID": r.id_no or "",
+            erows.append({"Code": r.code, "Name": r["name"], "Join Date": r.join_date, "Iqama ID": r.id_no or "",
                          "Passport No": r.passport_no or "", "Company": nm(cn, cid), "Section": nm(sn, sid),
                          "Sponsor": nm(kn, kid), "Labour": r.labour_type, "Pay": r.pay_type, "Mode": r.pay_mode,
                          "Monthly Basic Rate": r.rate if monthly else 0, "Hr Rate": 0 if monthly else r.rate,
@@ -593,6 +732,14 @@ def calc_payroll(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs="", cyc=False):
                          "Wknd OT": wk_pay, "Hol Pay": hol_pay, "Allowances": add, "Bonus": bonus, "Advance": adv,
                          "Absent Ded": abs_ded, "Deduction": ded, "Net": net, "Bank": net if r.pay_mode == "Bank" else 0,
                          "Cash": net if r.pay_mode != "Bank" else 0, "Invoice": tot_h * r.bill_rate})
+        if merge and len(erows) > 1:   # transferred inside the period: one line, shown at the LAST workplace
+            lastr = a.sort_values("day").iloc[-1]
+            m0 = dict(erows[0])
+            for k_ in SUMC:
+                m0[k_] = sum(x[k_] for x in erows)
+            m0["Company"], m0["Section"], m0["Sponsor"] = nm(cn, lastr.cid), nm(sn, lastr.sid), nm(kn, lastr.kid)
+            erows = [m0]
+        rows.extend(erows)
     df = pd.DataFrame(rows, columns=PCOLS).round(2)
     for col, v in (("Section", sec), ("Company", co), ("Sponsor", spn)):
         if v:
@@ -684,7 +831,7 @@ if "user" not in st.session_state:
     st.stop()
 role = st.session_state.role
 ALL = ["Dashboard", "Employees", "Transfer", "Setup", "Attendance", "Leave", "Adjustments", "Costs", "Payroll",
-       "Invoices", "Reports", "Import", "Settings"]
+       "Invoices", "Commission", "Reports", "Import", "Settings"]
 MENU = {"Admin": ALL + ["Users"], "HR": ALL, "Manager": ["Dashboard", "Attendance", "Leave", "Reports"]}[role]
 st.sidebar.title(f"🏢 {S('company')}")
 st.sidebar.write(f"👤 {st.session_state.user} ({role})")
@@ -692,7 +839,7 @@ if st.sidebar.button("Logout"):
     st.session_state.clear()
     st.rerun()
 ICON = {"Dashboard": "🏠", "Employees": "👥", "Setup": "🏷️", "Attendance": "🗓️", "Leave": "🌴", "Adjustments": "➕",
-        "Costs": "🧾", "Payroll": "💵", "Invoices": "📑", "Reports": "📊", "Import": "📥", "Transfer": "🔁", "Settings": "⚙️", "Users": "🔑"}
+        "Costs": "🧾", "Payroll": "💵", "Invoices": "📑", "Reports": "📊", "Import": "📥", "Transfer": "🔁", "Commission": "💰", "Settings": "⚙️", "Users": "🔑"}
 page = st.sidebar.radio("Menu", MENU, format_func=lambda x: f"{ICON.get(x, '')}  {x}")
 st.sidebar.caption(f"Today: {today().strftime(S('date_fmt'))} ({S('timezone')})")
 
@@ -771,7 +918,7 @@ if page == "Dashboard":
         ex = e[e.days_left <= 60][["code", "name", "section", "sponsor", "id_expiry", "days_left"]]
         if len(ex):
             st.subheader("⚠ ID / Iqama expired or expiring within 60 days")
-            st.dataframe(ex.sort_values("days_left"), hide_index=True, use_container_width=True)
+            tbl(ex.sort_values("days_left"), False)
 
 # ---------------- Employees
 elif page == "Employees":
@@ -814,19 +961,27 @@ elif page == "Employees":
                           join_date=str(jd), id_expiry=str(exp)))
             st.session_state["empv"], st.session_state["flash_emp"] = v + 1, f"Saved {code}"
             st.rerun()
+    showall = st.checkbox("Show deactivated employees too", key="emp_all")
     f = filters("emp")
-    df = apply_f(emp_df(), *f[2:]).drop(columns=["id", "company_id", "dept_id", "sponsor_id"])
+    df = apply_f(emp_df(None if showall else True), *f[2:]).drop(columns=["id", "company_id", "dept_id", "sponsor_id"])
+    df["status"] = df.active.map({1: "Active", 0: "Deactivated"})
     df["monthly_basic_rate"], df["hr_rate"] = df.rate.where(df.pay_type == "Monthly", 0), df.rate.where(df.pay_type == "Hourly", 0)
-    df = df.rename(columns={"id_no": "iqama_id"})[["code", "name", "join_date", "iqama_id", "passport_no", "company", "section",
+    df = df.rename(columns={"id_no": "iqama_id"})[["code", "name", "status", "join_date", "iqama_id", "passport_no", "company", "section",
                                                    "sponsor", "labour_type", "pay_type", "pay_mode", "monthly_basic_rate",
                                                    "hr_rate", "ot_rate", "food_allow", "special_allow", "other_allow",
                                                    "bill_rate", "nationality", "phone", "id_expiry"]]
-    st.dataframe(add_total(df), use_container_width=True, hide_index=True)
+    tbl(df)
     download(df, "employees", hdr_of(*f[:7]))
     if len(df):
         x = st.selectbox("Deactivate employee", df.code + " - " + df["name"])
         if st.button("Deactivate"):
             q("UPDATE employees SET active=0 WHERE code=?", (x.split(" - ")[0],), fetch=False); st.rerun()
+        st.caption("Deactivated staff keep all history and reports but no longer appear in the running attendance sheet and lists.")
+    inact = emp_df(False)
+    if len(inact):
+        y = st.selectbox("Reactivate employee", ["—"] + (inact.code + " - " + inact["name"]).tolist(), key="emp_re")
+        if y != "—" and st.button("Reactivate", key="emp_re_b"):
+            q("UPDATE employees SET active=1 WHERE code=?", (y.split(" - ")[0],), fetch=False); st.rerun()
 
 # ---------------- Transfer
 elif page == "Transfer":
@@ -864,7 +1019,7 @@ elif page == "Transfer":
     with t2:
         f = filters("trh")
         df = trf_df(f[0], f[1], f[2:]).drop(columns=["id"])
-        st.dataframe(add_total(df), use_container_width=True, hide_index=True)
+        tbl(df)
         download(df, "transfer_history", hdr_of(*f[:7]))
         st.caption("Edit or delete a history line in the section at the bottom of this page.")
     with t3:
@@ -878,11 +1033,11 @@ elif page == "Transfer":
                                   "Labour": r.labour_type, "Current company": r.company or "-",
                                   "Current section": r.section or "-", "Current kofil": r.sponsor or "-"}])
             st.subheader("Profile")
-            st.dataframe(prof, hide_index=True, use_container_width=True)
+            tbl(prof, False)
             st.subheader("Joined / transfers")
-            st.dataframe(ev, hide_index=True, use_container_width=True)
+            tbl(ev, False)
             st.subheader("Where he worked (from attendance)")
-            st.dataframe(add_total(wk), hide_index=True, use_container_width=True)
+            tbl(wk)
             try:
                 st.download_button("🖨 Employee document PDF (print)",
                                    doc_pdf(f"Employee document - {r.code} {r['name']}", f"Printed {today()}",
@@ -891,6 +1046,68 @@ elif page == "Transfer":
                                    f"employee_{r.code}.pdf", "application/pdf", key="trf_pdf")
             except ImportError:
                 st.caption("pip install reportlab")
+
+# ---------------- Commission
+elif page == "Commission":
+    st.header("Commission")
+    if st.session_state.get("flash_com"):
+        st.success(st.session_state.pop("flash_com"))
+    t1, t2 = st.tabs(["➕ Persons & rates", "📊 Commission report"])
+    with t1:
+        st.caption("Commission = total hours worked by ALL labour under the chosen Company / Section / Sponsor-Kofil "
+                   "(All = no limit) x the rate per hour. Add one line per person and scope; edit or delete lines at the "
+                   "bottom of this page. Lines of the same person that overlap are added twice, so keep them separate.")
+        cm, ds, sp = q("SELECT * FROM companies"), q("SELECT * FROM departments"), q("SELECT * FROM sponsors")
+        cv = st.session_state.get("comv", 0)
+        c = st.columns(4)
+        person, phone = c[0].text_input("Person name", key=f"cm1{cv}"), c[1].text_input("Phone", key=f"cm2{cv}")
+        crate, cnote = c[2].number_input("Commission rate per hour", 0.0, key=f"cm3{cv}"), c[3].text_input("Note", key=f"cm4{cv}")
+        c = st.columns(4)
+        sco = c[0].selectbox("Company", ["All"] + cm.name.tolist(), key=f"cm5{cv}")
+        sse = c[1].selectbox("Section", ["All"] + ds.name.tolist(), key=f"cm6{cv}")
+        ssp = c[2].selectbox("Sponsor / Kofil", ["All"] + sp.name.tolist(), key=f"cm7{cv}")
+        if c[3].button("➕ Add commission line", key=f"cm_add{cv}") and person.strip():
+            idf = lambda t, n: None if n == "All" else int(t[t.name == n].id.iloc[0])
+            q("INSERT INTO commissions(person,phone,company_id,dept_id,sponsor_id,rate,note,active) VALUES(?,?,?,?,?,?,?,1)",
+              (person.strip(), phone, idf(cm, sco), idf(ds, sse), idf(sp, ssp), float(crate), cnote), fetch=False)
+            st.session_state["comv"], st.session_state["flash_com"] = cv + 1, f"Added {person.strip()}"
+            st.rerun()
+        tbl(q("""SELECT k.id, k.person, k.phone, c.name AS company, d.name AS section, s.name AS sponsor, k.rate, k.note, k.active
+            FROM commissions k LEFT JOIN companies c ON c.id=k.company_id LEFT JOIN departments d ON d.id=k.dept_id
+            LEFT JOIN sponsors s ON s.id=k.sponsor_id ORDER BY k.person"""), False)
+    with t2:
+        f = pay_filters("com")
+        rules = q("""SELECT k.id, k.person, k.phone, c.name AS company, d.name AS section, s.name AS sponsor, k.rate, k.note, k.active
+            FROM commissions k LEFT JOIN companies c ON c.id=k.company_id LEFT JOIN departments d ON d.id=k.dept_id
+            LEFT JOIN sponsors s ON s.id=k.sponsor_id WHERE k.active=1 ORDER BY k.person""")
+        shown = False
+        for gi, (a, b, cs) in enumerate(st.session_state["_grp_com"]):
+            p = calc_payroll(a, b, f[2], f[3], f[4], f[5], cs, f[7], st.session_state["_cyc_com"], False)
+            if p.empty or rules.empty:
+                continue
+            rows = []
+            for _, k in rules.iterrows():
+                m = p
+                for col, val in (("Company", k.company), ("Section", k.section), ("Sponsor", k.sponsor)):
+                    if val:
+                        m = m[m[col] == val]
+                if m.empty:
+                    continue
+                hrs = float(m["Total Hrs"].sum())
+                rows.append({"Person": k.person, "Company": k.company or "All", "Section": k.section or "All",
+                             "Kofil": k.sponsor or "All", "Labour": int(m.Code.nunique()), "Total Hrs": round(hrs, 2),
+                             "Rate/hr": k.rate, "Commission": round(hrs * k.rate, 2)})
+            if not rows:
+                continue
+            shown = True
+            df = pd.DataFrame(rows)
+            st.subheader(f"Period {dmy(a)} to {dmy(b)}  -  {', '.join(cs) if cs else 'All companies'}")
+            tbl(df)
+            st.markdown("**Commission per person**")
+            tbl(df.groupby("Person", as_index=False).agg(**{"Total Hrs": ("Total Hrs", "sum"), "Commission": ("Commission", "sum")}))
+            download(df, "commission", hdr_of(a, b, f[2], f[3], f[4], f[5], cs), str(gi))
+        if not shown:
+            st.info("No commission in this period (add lines first, and make sure attendance is marked).")
 
 # ---------------- Setup
 elif page == "Setup":
@@ -902,19 +1119,19 @@ elif page == "Setup":
         cdy = st.number_input("Pay cycle start day (1 = whole month, 21 = 21st to 20th)", 1, 28, 1)
         if st.button("Add company") and n:
             q("INSERT OR IGNORE INTO companies(name,vat,cycle_day) VALUES(?,?,?)", (n, v, int(cdy)), fetch=False); st.rerun()
-        st.dataframe(q("SELECT name, vat, cycle_day FROM companies"), hide_index=True)
+        tbl(q("SELECT name, vat, cycle_day FROM companies"), False)
     with c2:
         st.subheader("Sections")
         n = st.text_input("New section")
         if st.button("Add section") and n:
             q("INSERT OR IGNORE INTO departments(name) VALUES(?)", (n,), fetch=False); st.rerun()
-        st.dataframe(q("SELECT name FROM departments"), hide_index=True)
+        tbl(q("SELECT name FROM departments"), False)
     with c3:
         st.subheader("Sponsors / Kofil")
         n, p_ = st.text_input("Sponsor / Kofil name"), st.text_input("Phone")
         if st.button("Add sponsor") and n:
             q("INSERT OR IGNORE INTO sponsors(name,phone) VALUES(?,?)", (n, p_), fetch=False); st.rerun()
-        st.dataframe(q("SELECT name, phone FROM sponsors"), hide_index=True)
+        tbl(q("SELECT name, phone FROM sponsors"), False)
 
 # ---------------- Attendance
 elif page == "Attendance":
@@ -936,7 +1153,7 @@ elif page == "Attendance":
     with c[4]:
         st.markdown('<span class="cb cb-st"></span>', unsafe_allow_html=True)
         pick = st.selectbox("Set status for ALL", ["—"] + list(LBL.values()), key="att_st")
-    qs = st.text_input("🔎 Search code / name", key="att_q")
+    qs = search_box("🔎 Search code / name", "att_q")
     if not (fco and fsec and fspn):
         st.warning("Company, Section and Sponsor / Kofil are mandatory. Select them (or choose 'All') "
                    "to open the attendance sheet.")
@@ -970,9 +1187,9 @@ elif page == "Attendance":
         if hflag:
             st.info("Special holiday today for some of these staff: they start as O (no work, no pay). Mark P only for "
                     "those who worked - all their hours are paid at the holiday rate (or their OT rate).")
-        ed = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True,
+        ed = st.data_editor(pd.DataFrame(rows).pipe(lambda d: d.insert(0, "S/L", range(1, len(d) + 1)) or d), hide_index=True, use_container_width=True,
                             key=f"att{day}{fco}{fsec}{fspn}{pick}{qs}",
-                            disabled=["id", "Code", "Name", "Iqama ID", "Passport No", "Pay Type", "Labour", "Sponsor",
+                            disabled=["S/L", "id", "Code", "Name", "Iqama ID", "Passport No", "Pay Type", "Labour", "Sponsor",
                                       "OT Rate", "Total Hrs"],
                             column_config={"id": None,
                                            "Company": st.column_config.SelectboxColumn(options=[""] + cl),
@@ -985,18 +1202,13 @@ elif page == "Attendance":
             sc = ed.Status.str[-1]
             isp = sc == "P"
             nh_, oh_ = ed["Normal Hrs"].where(isp, 0.0), ed["OT Hrs"].where(isp, 0.0)
-            st.dataframe(pd.DataFrame([{"TOTAL": f"{len(ed)} staff", "P": int(isp.sum()), "A": int((sc == "A").sum()),
+            tbl(pd.DataFrame([{"TOTAL": f"TOTAL ({len(ed)} staff)", "P": int(isp.sum()), "A": int((sc == "A").sum()),
                                         "L": int((sc == "L").sum()), "O": int((sc == "O").sum()),
                                         "Normal Hrs": round(nh_.sum(), 2), "OT Hrs": round(oh_.sum(), 2),
-                                        "Total Hrs": round((nh_ + oh_).sum(), 2)}]), hide_index=True, use_container_width=True)
+                                        "Total Hrs": round((nh_ + oh_).sum(), 2)}]), False)
             sheet = sign(ed.drop(columns=["id"]).assign(Status=sc, **{"Normal Hrs": nh_, "OT Hrs": oh_, "Total Hrs": nh_ + oh_}))
-            try:
-                st.download_button("🖨 Attendance sheet PDF (print)",
-                                   df_pdf(add_total(sheet), f"Attendance {day}",
-                                          hdr_of(str(day), str(day), eff(fsec, sl), (), (), eff(fspn, kl), eff(fco, cl))),
-                                   f"attendance_{day}.pdf", "application/pdf", key="att_pdf")
-            except ImportError:
-                st.caption("pip install reportlab")
+            st.session_state["_monlab"] = f"Attendance date: {day.strftime('%d/%m/%Y')}"
+            download(sheet, f"attendance_{day}", hdr_of(str(day), str(day), eff(fsec, sl), (), (), eff(fspn, kl), eff(fco, cl)), "att")
         st.caption("🟢 P = Present (paid), 🟡 L = Leave (paid), 🔴 A = Absent (not paid), ⚪ O = Off (not paid). "
                    "'Set status for ALL' fills every row with the chosen status - then change single rows if needed. "
                    "Normal / OT hours are pre-filled from Settings (default 10 + 2). Total Hrs updates after Save. "
@@ -1031,7 +1243,7 @@ elif page == "Leave":
         LEFT JOIN departments d ON d.id=e.dept_id LEFT JOIN sponsors s ON s.id=e.sponsor_id LEFT JOIN companies c ON c.id=e.company_id
         WHERE l.start<=? AND l.end>=?""", (d2, d1))
     df = apply_f(df, sec, lt, pt, spn, co, qs)
-    st.dataframe(add_total(df), use_container_width=True, hide_index=True); download(df, "leave", hdr_of(d1, d2, sec, lt, pt, spn, co))
+    tbl(df); download(df, "leave", hdr_of(d1, d2, sec, lt, pt, spn, co))
     pend = df[df.status == "Pending"]
     if len(pend):
         i = st.selectbox("Pending request ID", pend.id)
@@ -1070,7 +1282,7 @@ elif page == "Adjustments":
         LEFT JOIN departments d ON d.id=e.dept_id LEFT JOIN sponsors s ON s.id=e.sponsor_id LEFT JOIN companies c ON c.id=e.company_id
         WHERE a.day BETWEEN ? AND ?""", (f[0], f[1]))
     df = apply_f(df, *f[2:])
-    st.dataframe(add_total(df), use_container_width=True, hide_index=True)
+    tbl(df)
     download(df, "adjustments", hdr_of(*f[:7]))
     rid = st.number_input("Delete entry ID", 0, step=1)
     if st.button("Delete entry") and rid:
@@ -1088,7 +1300,7 @@ elif page == "Users":
             q("INSERT INTO users(username,pw,role) VALUES(?,?,?) ON CONFLICT(username) "
               "DO UPDATE SET pw=excluded.pw, role=excluded.role", (u, pw(p_), ro), fetch=False)
             st.rerun()
-    st.dataframe(q("SELECT username, role FROM users"), hide_index=True)
+    tbl(q("SELECT username, role FROM users"), False)
     others = [x for x in q("SELECT username FROM users").username if x != st.session_state.user]
     d = st.selectbox("Delete user", others)
     if st.button("Delete user") and d:
@@ -1107,7 +1319,7 @@ elif page == "Payroll":
         shown = True
         df = view_pay(raw)
         st.subheader(f"Period {a} to {b}  -  {', '.join(cs) if cs else 'All companies'}")
-        st.dataframe(add_total(df), use_container_width=True, hide_index=True)
+        tbl(df)
         c = st.columns(3)
         c[0].metric("Total Net", f"{raw.Net.sum():,.2f} {cur_}")
         c[1].metric("Company labour", f"{raw[raw.Labour == 'Company'].Net.sum():,.2f} {cur_}")
@@ -1146,8 +1358,8 @@ elif page == "Costs":
         LEFT JOIN companies c ON c.id=x.company_id LEFT JOIN departments d ON d.id=e.dept_id
         LEFT JOIN sponsors s ON s.id=e.sponsor_id WHERE x.day BETWEEN ? AND ?""", (f[0], f[1]))
     df = apply_f(df, *f[2:])
-    st.dataframe(add_total(df), use_container_width=True, hide_index=True)
-    st.dataframe(add_total(df.groupby("category").amount.sum().reset_index()), hide_index=True)
+    tbl(df)
+    tbl(df.groupby("category").amount.sum().reset_index())
     download(df, "costs", hdr_of(*f[:7]))
     rid = st.number_input("Delete cost ID", 0, step=1)
     if st.button("Delete cost") and rid:
@@ -1159,7 +1371,7 @@ elif page == "Invoices":
     f = pay_filters("inv")
     vat, shown = float(S("vat_pct")), False
     for gi, (a, b, cs) in enumerate(st.session_state["_grp_inv"]):
-        p = calc_payroll(a, b, f[2], f[3], f[4], f[5], cs, f[7], st.session_state["_cyc_inv"])
+        p = calc_payroll(a, b, f[2], f[3], f[4], f[5], cs, f[7], st.session_state["_cyc_inv"], False)
         if p.empty:
             continue
         shown = True
@@ -1173,7 +1385,7 @@ elif page == "Invoices":
         g["Invoice + VAT"] = g.Invoice + g.VAT
         g["Profit"] = g.Invoice - g.Payroll - g.Costs
         g = g.round(2)
-        st.dataframe(add_total(g), use_container_width=True, hide_index=True)
+        tbl(g)
         c = st.columns(3)
         c[0].metric("Invoice (ex VAT)", f"{g.Invoice.sum():,.2f} {cur_}")
         c[1].metric("Payroll + costs", f"{g.Payroll.sum() + g.Costs.sum():,.2f} {cur_}")
@@ -1182,7 +1394,7 @@ elif page == "Invoices":
         who = st.selectbox("Invoice detail for company", g.Company, key=f"inv_w{gi}")
         d = p[p.Company == who][["Name", "Iqama ID", "Passport No", "Section", "Total Hrs", "Invoice"]].copy()
         d["Rate/hr"] = (d.Invoice / d["Total Hrs"].where(d["Total Hrs"] > 0)).round(2)
-        st.dataframe(add_total(d), use_container_width=True, hide_index=True)
+        tbl(d)
         download(d, "invoice_" + who.replace(" ", "_"), hdr_of(a, b, f[2], f[3], f[4], f[5], cs), str(gi))
     if not shown:
         st.info("No attendance in this period.")
@@ -1331,7 +1543,7 @@ elif page == "Reports":
             continue
         shown = True
         st.subheader(f"{kind}  |  Period {a} to {b}  -  {', '.join(cs) if cs else 'All companies'}")
-        st.dataframe(add_total(df), use_container_width=True, hide_index=True)
+        tbl(df)
         download(df, kind.replace(" ", "_").replace("(", "").replace(")", "").replace("/", ""), hdr_of(*fi[:7]), str(gi))
     if not shown:
         st.info("No data in this period.")
@@ -1339,6 +1551,11 @@ elif page == "Reports":
 # ---------------- Settings
 elif page == "Settings":
     st.header("Settings")
+    st.info("**Pay rules in this software**  \n"
+            "• **Special allowance** is a FIXED monthly amount: no reduction for absence, no penalty, no deduction.  \n"
+            "• **Food and Other allowance** follow the working days (days - Fridays - special holidays).  \n"
+            "• **Absence:** that day's basic is not paid AND basic / total days of the month is deducted (basic only, never food).  \n"
+            "• **Bonus** for a full month = basic / total days of the month.")
     with st.form("set"):
         co = st.text_input("Company name", S("company"))
         cu = st.text_input("Currency", S("currency"))
@@ -1419,7 +1636,7 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
             pt = eff(msel("Pay type", ["Monthly", "Hourly"], flt + "_pay"), ["Monthly", "Hourly"])
         df = apply_f(df, sec, lt, pt, spn, co).reset_index(drop=True)
         fsig = str((co, sec, spn, lt, pt))
-    sq_ = st.text_input("🔎 Search", key=key + "q")
+    sq_ = search_box("🔎 Search", key + "q")
     if sq_ and not df.empty:
         df = df[df.astype(str).apply(lambda col: col.str.contains(sq_, case=False, regex=False)).any(axis=1)].reset_index(drop=True)
     if df.empty:
@@ -1429,6 +1646,7 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
     view = df.copy()
     for c in fks:
         view[c] = view[c].fillna("")
+    view.insert(0, "S/L", range(1, len(view) + 1))
     all_del = False
     if can_d:
         all_del = st.checkbox("☑ Select all rows for Delete (only the rows shown below)", key=f"{key}da{st.session_state.get(key + 'v', 0)}")
@@ -1444,11 +1662,10 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
     ver = st.session_state.get(key + "v", 0)
     ed = st.data_editor(view, hide_index=True, use_container_width=True, column_config=cfg,
                         disabled=[c for c in view.columns if c not in editable], key=f"{key}{ver}{sq_}{fsig}{all_del}")
-    _n = [c for c in ed.columns if c not in ("id", "emp_id", "Delete", "active") and pd.api.types.is_numeric_dtype(ed[c])
+    _n = [c for c in ed.columns if c not in ("S/L", "id", "emp_id", "Delete", "active") and pd.api.types.is_numeric_dtype(ed[c])
           and not pd.api.types.is_bool_dtype(ed[c]) and "rate" not in c.lower()]
     if _n:
-        st.dataframe(pd.DataFrame([{"TOTAL": f"{len(ed)} rows", **{c: round(float(ed[c].sum()), 2) for c in _n}}]),
-                     hide_index=True, use_container_width=True)
+        tbl(pd.DataFrame([{"TOTAL": f"TOTAL ({len(ed)} rows)", **{c: round(float(ed[c].sum()), 2) for c in _n}}]), False)
 
     def done(msg):
         st.session_state[key + "v"] = ver + 1
@@ -1541,7 +1758,7 @@ def att_post(df):   # extra display columns for the attendance records grid
     return df.drop(columns=["_rate", "_otr"])
 
 
-if role in CAN_EDIT + CAN_DELETE and page in ("Settings", "Employees", "Transfer", "Setup", "Attendance", "Leave", "Adjustments", "Costs", "Users"):
+if role in CAN_EDIT + CAN_DELETE and page in ("Commission", "Settings", "Employees", "Transfer", "Setup", "Attendance", "Leave", "Adjustments", "Costs", "Users"):
     st.divider()
     st.subheader("✏️ Edit / 🗑 Delete")
     st.caption("Choose Company / Section / Kofil (or All), change cells, then press Save. To delete: tick 'Delete', "
@@ -1618,6 +1835,14 @@ if role in CAN_EDIT + CAN_DELETE and page in ("Settings", "Employees", "Transfer
                selects={"category": ["ID / Iqama (Juazat)", "Work permit", "Insurance", "Transfer", "Muqeem / Monduf fee",
                                      "Exit re-entry", "Passport", "Medical", "Vacation ticket", "GOSI", "Other"]},
                key="cst", flt="xcost", cols=cc[2:])
+
+    elif page == "Commission":
+        manage("commissions", """SELECT k.id, k.person, k.phone, c.name AS company, d.name AS section, s.name AS sponsor, k.rate, k.note, k.active
+            FROM commissions k LEFT JOIN companies c ON c.id=k.company_id LEFT JOIN departments d ON d.id=k.dept_id
+            LEFT JOIN sponsors s ON s.id=k.sponsor_id ORDER BY k.person""", edit=["person", "phone", "rate", "note", "active"],
+               fks={"company": ("company_id", "companies"), "section": ("dept_id", "departments"),
+                    "sponsor": ("sponsor_id", "sponsors")}, selects={"active": [1, 0]}, key="com")
+        st.caption("Active 1 = counted in the report, 0 = paused. Empty Company / Section / Kofil = no limit.")
 
     elif page == "Settings":
         manage("holidays", """SELECT h.id, h.from_day, h.to_day, c.name AS company, d.name AS section, s.name AS sponsor,
