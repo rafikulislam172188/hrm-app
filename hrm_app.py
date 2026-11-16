@@ -1,7 +1,7 @@
 """International HRM - Streamlit + SQLite
 Run: pip install streamlit pandas && streamlit run hrm_app.py
 """
-import sqlite3, hashlib, io, html, calendar, hmac
+import sqlite3, hashlib, io, html, calendar, hmac, re
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, available_timezones
 import pandas as pd
@@ -129,7 +129,7 @@ def payslip_pdf(r, d1, d2):
             continue
         c.setFont("Helvetica-Bold" if k == "Net" else "Helvetica", 11)
         c.drawString(50, y, k)
-        c.drawString(250, y, f"{r[k]}" + (f" {S('currency')}" if k in money else ""))
+        c.drawString(250, y, f"{maybe_dmy(r[k])}" + (f" {S('currency')}" if k in money else ""))
         y -= 18
     c.drawString(50, y - 20, "Employee signature: ____________        HR signature: ____________")
     c.save()
@@ -201,6 +201,7 @@ def doc_pdf(title, hdr, sections):
     b, sty = io.BytesIO(), getSampleStyleSheet()
     els = [Paragraph(f"<b>{S('company')} - {title}</b>", sty["Title"]), Paragraph(hdr, sty["Normal"]), Spacer(1, 8)]
     for h, d in sections:
+        d = fmt_dates(d)
         data = [[str(c) for c in d.columns]] + [["" if pd.isna(v) else (f"{v:,.2f}" if isinstance(v, float) else str(v))[:34]
                                                   for v in row] for row in d.itertuples(index=False)]
         t = Table(data, repeatRows=1)
@@ -422,7 +423,7 @@ def add_total(df, total=True):
     """S/L serial numbers + a TOTAL row (sum of every numeric column except rates)."""
     if df.empty:
         return df
-    d = df.copy()
+    d = fmt_dates(df).copy()
     fc = d.columns[1] if d.columns[0] == "S/L" and len(d.columns) > 1 else d.columns[0]
     if d[fc].astype(str).str.upper().str.startswith("TOTAL").any():
         return d
@@ -434,7 +435,11 @@ def add_total(df, total=True):
     t = {c: (float("nan") if isn(c) else "") for c in d.columns}
     t.update({c: round(float(d[c].sum()), 2) for c in num})
     t[next(c for c in d.columns if c != "S/L" and not isn(c))] = f"TOTAL ({len(d)})"
-    return pd.concat([d, pd.DataFrame([t])], ignore_index=True)
+    ints = [c for c in d.columns if pd.api.types.is_integer_dtype(d[c])]
+    out = pd.concat([d, pd.DataFrame([t])], ignore_index=True)
+    for c in ints:   # counts (days, persons) stay whole numbers
+        out[c] = out[c].astype("Int64")
+    return out
 
 
 def tbl(df, total=True):
@@ -471,6 +476,49 @@ def dmy(x):
         return str(x)
 
 
+ISO_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+EMPTY = ("", "None", "nan", "NaT")
+
+
+def date_cols(df):
+    """Text columns whose filled cells are all ISO dates (2026-11-20)."""
+    out = []
+    for c in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_bool_dtype(df[c]):   # object or string dtype
+            v = df[c].dropna().astype(str)
+            v = v[~v.isin(EMPTY)]
+            if len(v) and v.map(lambda x: bool(ISO_RE.fullmatch(x))).all():
+                out.append(c)
+    return out
+
+
+def fmt_dates(df):
+    """Show every date column as DD/MM/YYYY."""
+    cols = date_cols(df)
+    if not cols:
+        return df
+    df = df.copy()
+    for c in cols:
+        df[c] = df[c].map(lambda v: dmy(v) if str(v) not in EMPTY else v)
+    return df
+
+
+def to_iso(v):
+    """DD/MM/YYYY (or YYYY-MM-DD) -> YYYY-MM-DD, None when it is not a real date."""
+    v = str(v).strip()
+    if ISO_RE.fullmatch(v):
+        return v
+    m = re.fullmatch(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})", v)
+    try:
+        return date(int(m.group(3)), int(m.group(2)), int(m.group(1))).isoformat() if m else None
+    except ValueError:
+        return None
+
+
+def maybe_dmy(v):
+    return dmy(v) if isinstance(v, str) and ISO_RE.fullmatch(v) else v
+
+
 class Hdr(str):
     """Header text that also carries its parts (company, kofil, month) for the custom print."""
 
@@ -485,71 +533,97 @@ def hdr_of(d1, d2, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
     return h
 
 
-def df_pdf(df, title, hdr=""):
-    """One landscape page whenever possible: font and column widths shrink to fit; header shows the selected filters."""
+def _pdf_fit(data, W, H, m, top, fs_max=8.0, check_h=True):
+    """Largest font (>= 4pt) where every column is as wide as its widest text; returns font size and column widths."""
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    n, availw, availh = len(data[0]), W - 2 * m - 2, H - m - top
+    base = [max(stringWidth(r_[i], "Helvetica-Bold" if j == 0 else "Helvetica", 1) for j, r_ in enumerate(data)) for i in range(n)]
+    fs = fs_max
+    while fs > 4:
+        if sum(b * fs + 5 for b in base) <= availw and (not check_h or (fs * 1.15 + 3) * len(data) <= availh):
+            break
+        fs -= 0.25
+    wid = [b * fs + 5 for b in base]
+    return fs, [w * (availw / sum(wid) if sum(wid) > availw else min(availw / sum(wid), 1.5)) for w in wid]
+
+
+def _pdf_clip(data, wid, fs):
+    """Cut text that is wider than its column (with '..'), so columns never overlap."""
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    out = []
+    for j, row in enumerate(data):
+        fn, new = "Helvetica-Bold" if j == 0 else "Helvetica", []
+        for t_, w in zip(row, wid):
+            while len(t_) > 1 and stringWidth(t_, fn, fs) > w - 3:
+                t_ = t_[:-3] + ".." if len(t_) > 3 else t_[:-1]
+            new.append(t_)
+        out.append(new)
+    return out
+
+
+def _pdf_style(fs, istot, rowpad=1.5):
     from reportlab.lib import colors
+    st_ = [("FONTSIZE", (0, 0), (-1, -1), fs), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#14472f")),
+           ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+           ("GRID", (0, 0), (-1, -1), 0.3, colors.grey), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+           ("TOPPADDING", (0, 0), (-1, -1), rowpad), ("BOTTOMPADDING", (0, 0), (-1, -1), rowpad),
+           ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2)]
+    if istot:   # TOTAL row: bold, coloured, thicker line above
+        st_ += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#fde68a")),
+                ("TEXTCOLOR", (0, -1), (-1, -1), colors.HexColor("#7c2d12")), ("LINEABOVE", (0, -1), (-1, -1), 1.2, colors.HexColor("#7c2d12"))]
+    return st_
+
+
+def _pdf_data(df, cap=40):
+    fmt = lambda v: "" if pd.isna(v) else (f"{v:,.2f}" if isinstance(v, float) else str(v))
+    return [[str(c) for c in df.columns]] + [[fmt(v)[:cap] for v in row] for row in df.itertuples(index=False)]
+
+
+def df_pdf(df, title, hdr=""):
+    """One landscape page whenever possible; every column is as wide as its text, nothing overlaps."""
     from reportlab.lib.pagesizes import A3, A4, landscape
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-    b, n, m = io.BytesIO(), max(len(df.columns), 1), 16
-    W, H = landscape(A3 if n > 14 else A4)
-    fmt = lambda v: "" if pd.isna(v) else (f"{v:,.2f}" if isinstance(v, float) else str(v))
-    data = [[str(c) for c in df.columns]] + [[fmt(v)[:24] for v in row] for row in df.itertuples(index=False)]
+    df = fmt_dates(df)
+    data = _pdf_data(df)
     istot = len(data) > 1 and any(c.startswith("TOTAL") for c in data[-1])
-    lens = [max(3, max(len(r_[i]) for r_ in data)) for i in range(n)]
-    fs = 8.0
-    while True:
-        wid = [l * fs * 0.55 + 5 for l in lens]
-        rh = fs * 1.15 + 3
-        if (sum(wid) <= W - 2 * m and rh * len(data) <= H - 2 * m - 85) or fs <= 4:
+    m = 16
+    for ps in ([landscape(A4)] if len(df.columns) <= 14 else []) + [landscape(A3)]:
+        fs, wid = _pdf_fit(data, ps[0], ps[1], m, 88)
+        if fs >= 6:
             break
-        fs -= 0.5
-    k = min((W - 2 * m) / sum(wid), 1.5)
-    t = Table(data, colWidths=[w * k for w in wid], repeatRows=1)
-    st_ = [("FONTSIZE", (0, 0), (-1, -1), fs), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#14472f")),
-           ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-           ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
-           ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2)]
-    if istot:
-        st_ += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#fde68a")),
-                ("TEXTCOLOR", (0, -1), (-1, -1), colors.HexColor("#7c2d12"))]
-    t.setStyle(TableStyle(st_))
+    t = Table(_pdf_clip(data, wid, fs), colWidths=wid, repeatRows=1)
+    t.setStyle(TableStyle(_pdf_style(fs, istot)))
     sty = getSampleStyleSheet()
     sm = ParagraphStyle("sm", parent=sty["Normal"], fontSize=8, leading=10)
-    SimpleDocTemplate(b, pagesize=(W, H), leftMargin=m, rightMargin=m, topMargin=m, bottomMargin=m).build([
+    b = io.BytesIO()
+    SimpleDocTemplate(b, pagesize=ps, leftMargin=m, rightMargin=m, topMargin=m, bottomMargin=m).build([
         Paragraph(f"<b>{S('company')} - {title}</b>", ParagraphStyle("h", parent=sty["Title"], fontSize=14, leading=16, spaceAfter=2)),
         Paragraph(str(hdr), sm), Paragraph(f"Printed {dmy(today())}  |  {len(df) - (1 if istot else 0)} rows", sm),
         Spacer(1, 4), t])
     return b.getvalue()
 
 
-def df_pdf_custom(df, cols, rowh, hdr, title):
-    """Only the chosen columns, your row height, and a header on EVERY page: client company (big, bold),
-    kofil (bold) and 'For the month of ...' centred; period / section / labour / pay type at the top left."""
-    from reportlab.lib import colors
+def df_pdf_custom(df, cols, rowh, hdr, title, paper="A4", fit=False):
+    """Only the chosen columns, your row height, a header on EVERY page (client company big + bold, kofil bold,
+    'For the month of ...'; period / section / labour / pay type at the top left). TOTAL row bold + coloured."""
     from reportlab.lib.pagesizes import A3, A4, landscape
     from reportlab.pdfbase.pdfmetrics import stringWidth
     from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate, Table, TableStyle
-    d = df[[c for c in df.columns if c in cols]]
-    b, n, m, top = io.BytesIO(), max(len(d.columns), 1), 18, 96
-    W, H = landscape(A3 if n > 14 else A4)
-    fs = max(5.0, min(11.0, rowh * 0.5))
-    fmt = lambda v: "" if pd.isna(v) else (f"{v:,.2f}" if isinstance(v, float) else str(v))
-    data = [[str(c) for c in d.columns]] + [[fmt(v)[:28] for v in row] for row in d.itertuples(index=False)]
-    istot = len(data) > 1 and any(c.startswith("TOTAL") for c in data[-1])
-    wid = [max(3, max(len(r_[i]) for r_ in data)) * fs * 0.56 + 6 for i in range(n)]
-    k = min((W - 2 * m) / sum(wid), 1.6)
-    t = Table(data, colWidths=[w * k for w in wid], rowHeights=[rowh] * len(data), repeatRows=1)
-    st_ = [("FONTSIZE", (0, 0), (-1, -1), fs), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#14472f")),
-           ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
-           ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2),
-           ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]
-    if istot:
-        st_ += [("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#fde68a")),
-                ("TEXTCOLOR", (0, -1), (-1, -1), colors.HexColor("#7c2d12"))]
-    t.setStyle(TableStyle(st_))
-    co_ = getattr(hdr, "co", "All") + (" " if getattr(hdr, "co", "") else "")
-    lines = [(f"{getattr(hdr, 'co', 'All')}", "Helvetica-Bold", 17), (f"Sponsor / Kofil: {getattr(hdr, 'kofil', 'All')}", "Helvetica-Bold", 12),
+    d = fmt_dates(df)
+    istot = len(d) > 0 and any(str(v).startswith("TOTAL") for v in d.iloc[-1].tolist())
+    data = _pdf_data(d[[c for c in d.columns if c in cols]], 30)
+    if istot and not any(c.startswith("TOTAL") for c in data[-1]):   # the label column was not chosen: label the row anyway
+        i0 = next((i for i, c in enumerate(data[-1]) if c == ""), 0)
+        data[-1][i0] = "TOTAL" if data[-1][i0] == "" else "TOTAL " + data[-1][i0]
+    W, H = landscape(A3 if paper == "A3" else A4)
+    m, top = 18, 96
+    if fit:
+        rowh = max(8, min(rowh, (H - top - m) / len(data)))
+    fs, wid = _pdf_fit(data, W, H, m, top, min(11.0, max(4.5, rowh * 0.5)), check_h=False)
+    t = Table(_pdf_clip(data, wid, fs), colWidths=wid, rowHeights=[rowh] * len(data), repeatRows=1)
+    t.setStyle(TableStyle(_pdf_style(fs, istot, 0)))
+    lines = [(getattr(hdr, "co", "All"), "Helvetica-Bold", 17), (f"Sponsor / Kofil: {getattr(hdr, 'kofil', 'All')}", "Helvetica-Bold", 12),
              (getattr(hdr, "month", ""), "Helvetica-Bold", 11)]
 
     def head(c, doc):
@@ -568,6 +642,7 @@ def df_pdf_custom(df, cols, rowh, hdr, title):
         c.drawRightString(W - m, H - 30, f"Page {doc.page}   |   Printed {dmy(today())}")
         c.restoreState()
 
+    b = io.BytesIO()
     doc = BaseDocTemplate(b, pagesize=(W, H), leftMargin=m, rightMargin=m, topMargin=top, bottomMargin=m)
     doc.addPageTemplates([PageTemplate(frames=[Frame(m, m, W - 2 * m, H - top - m, id="f", leftPadding=0, rightPadding=0,
                                                       topPadding=0, bottomPadding=0)], onPage=head)])
@@ -587,12 +662,14 @@ def download(df, name, hdr="", uid=""):
         c[1].caption("pip install reportlab")
         return
     if c[2].checkbox("🖨 Custom print", key="cp_" + name + uid):
-        cc = st.columns([4, 1, 1])
+        cc = st.columns([5, 1.2, 1, 1.4])
         cols = cc[0].multiselect("Columns to print (only these are printed)", list(df.columns), default=list(df.columns),
                                  key="cpc_" + name + uid)
         rh = cc[1].number_input("Row height (px)", 8, 300, 22, key="cph_" + name + uid)
-        cc[2].download_button("⬇ Custom PDF", df_pdf_custom(df, cols, rh, hdr, name.replace("_", " ")),
-                              f"{name}_custom_{today()}.pdf", "application/pdf", key="cpd_" + name + uid)
+        paper = cc[2].selectbox("Paper", ["A4", "A3"], key="cpp_" + name + uid)
+        fit = cc[3].checkbox("Fit on one page", key="cpf_" + name + uid)
+        st.download_button("⬇ Custom PDF", df_pdf_custom(df, cols, rh, hdr, name.replace("_", " "), paper, fit),
+                           f"{name}_custom_{today()}.pdf", "application/pdf", key="cpd_" + name + uid)
 
 
 PCOLS = ["Code", "Name", "Join Date", "Iqama ID", "Passport No", "Company", "Section", "Sponsor", "Labour", "Pay", "Mode",
@@ -1620,6 +1697,16 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
     df = q(sql, params)
     if post is not None and not df.empty:
         df = post(df)
+    dcols = date_cols(df)
+    for c in dcols:
+        df[c] = df[c].map(lambda v: dmy(v) if str(v) not in EMPTY else v)
+
+    def isorow(x):   # hooks (leave sync etc.) work with ISO dates
+        x = x.copy()
+        for c in dcols:
+            if c in x.index and str(x[c]) not in EMPTY:
+                x[c] = to_iso(x[c]) or x[c]
+        return x
     fsig = ""
     if flt:   # Company / Section / Kofil / Labour / Pay type boxes with 'All' inside, same as the report pages
         cos, secs, spns = (q(f"SELECT name FROM {t}").name.tolist() for t in ("companies", "departments", "sponsors"))
@@ -1685,13 +1772,20 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
                     m = t[t.name == a].id
                     sets[fks[c][0]] = int(m.iloc[0]) if len(m) else None
                 else:
-                    sets[c] = None if pd.isna(a) else (a.item() if hasattr(a, "item") else a)
+                    val = None if pd.isna(a) else (a.item() if hasattr(a, "item") else a)
+                    if c in dcols and val not in (None, ""):
+                        iso = to_iso(val)
+                        if iso is None:
+                            st.error(f"Row {int(r['id'])}: '{val}' is not a date - write it as DD/MM/YYYY")
+                            return
+                        val = iso
+                    sets[c] = val
             if sets:
                 try:
                     q(f"UPDATE {table} SET " + ",".join(f"{k}=?" for k in sets) + " WHERE id=?",
                       (*sets.values(), int(r["id"])), fetch=False)
                     if after_upd:
-                        after_upd(o, r)
+                        after_upd(isorow(o), isorow(r))
                     n += 1
                 except Exception as ex:
                     st.error(f"Row {int(r['id'])}: {ex}")
@@ -1717,7 +1811,7 @@ def manage(table, sql, params=(), edit=(), fks=None, selects=None, hide=(), used
                             errs.append(msg or f"id {i} is still used in '{busy[0]}' - reassign it first")
                             continue
                         if before_del:
-                            before_del(r)
+                            before_del(isorow(r))
                         for t, c in cascade:
                             q(f"DELETE FROM {t} WHERE {c}=?", (i,), fetch=False)
                         q(f"DELETE FROM {table} WHERE id=?", (i,), fetch=False)
