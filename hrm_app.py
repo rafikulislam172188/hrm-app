@@ -123,7 +123,7 @@ def payslip_pdf(r, d1, d2):
     y = 800
     c.setFont("Helvetica-Bold", 16); c.drawString(50, y, f"{S('company')} - PAYSLIP"); y -= 25
     c.setFont("Helvetica", 11); c.drawString(50, y, f"Period: {d1} to {d2}"); y -= 30
-    money = {"Monthly Basic", "Hr Rate", "OT Rate", "Basic", "Food", "Special Allow", "Other Allow", "OT Pay", "Wknd OT", "Hol Pay", "Allowances", "Bonus", "Advance", "Absent Ded", "Deduction", "Net"}
+    money = {"M Basic", "Hr Rate", "OT Rate", "Basic", "Food", "Special Allow", "Other Allow", "OT Pay", "Wknd OT", "Hol Pay", "Allowances", "Bonus", "Advance", "Absent Ded", "Deduction", "Net"}
     for k in r.index:
         if k in ("Invoice", "Bank", "Cash"):
             continue
@@ -415,7 +415,7 @@ def apply_f(df, sec=(), lt=(), pt=(), spn=(), co=(), qs=""):
     return df
 
 
-RATECOLS = {"rate", "Rate", "Monthly Basic", "Hr Rate", "OT Rate", "OT_Rate", "ot_rate", "bill_rate", "Rate/hr", "active",
+RATECOLS = {"rate", "Rate", "M Basic", "Hr Rate", "OT Rate", "OT_Rate", "ot_rate", "bill_rate", "Rate/hr", "active",
             "id", "monthly_basic_rate", "hr_rate", "Years", "Monthly wage", "cycle_day"}
 
 
@@ -673,7 +673,7 @@ def download(df, name, hdr="", uid=""):
 
 
 PCOLS = ["Code", "Name", "Join Date", "Iqama ID", "Passport No", "Company", "Section", "Sponsor", "Labour", "Pay", "Mode",
-         "Monthly Basic", "Hr Rate", "OT Rate", "Days", "Leave", "Absent", "Normal Hrs", "OT Hrs", "Wknd Hrs",
+         "M Basic", "Hr Rate", "OT Rate", "Days", "Leave", "Absent", "Normal Hrs", "OT Hrs", "Wknd Hrs",
          "Hol Hrs", "Total Hrs", "Basic", "Food", "Special Allow", "Other Allow", "OT Pay", "Wknd OT", "Hol Pay",
          "Allowances", "Bonus", "Advance", "Absent Ded", "Deduction", "Net", "Bank", "Cash", "Invoice"]
 PVIEW = [c for c in PCOLS if c != "Invoice"]
@@ -689,7 +689,7 @@ def _wd(y, m, we):
 
 def view_pay(p):
     d = p[PVIEW].copy()
-    for c in ("Monthly Basic", "Hr Rate"):
+    for c in ("M Basic", "Hr Rate"):
         d[c] = d[c].where(d[c] != 0, "")
     return sign(d)
 
